@@ -2,6 +2,15 @@
 
 Guidance for coding agents working on Bumpkin.
 
+## Agent behavior
+
+These guidelines bias toward caution over speed; use judgment for trivial tasks.
+
+- Think before coding: state assumptions, surface ambiguity and tradeoffs, ask when unclear, and push back on overcomplicated or risky requests.
+- Keep solutions simple: implement only what was asked, avoid speculative abstractions/configuration, and rewrite if the change is larger than the problem warrants.
+- Make surgical changes: touch only lines directly related to the request, match existing style, and do not clean up unrelated code. Remove only unused code that your change created.
+- Work toward verifiable goals: for multi-step work, state a brief plan with checks; prefer tests or concrete commands that prove the change works.
+
 ## Project
 
 Bumpkin is a Rust/Nix flake upkeep bot. It should work for arbitrary flake package sets, not only `NixOS/nixpkgs`. Do not preserve `nixpkgs-upkeep` behavior for its own sake; use it only as historical reference.
@@ -30,6 +39,6 @@ bumpkin update --package arcbrush --root ../tixpkgs2 --commit --signed
 
 ## Current caveats
 
-- `dry-run` is intentionally source-first: it searches package files by maintainer before evaluation.
-- `run-update-script` currently supports flake package outputs.
+- Maintainer scans default to evaluating `packages.$system.*.meta.maintainers`; source scanning is a fallback.
+- `run-update-script` currently supports flake package outputs and checks `passthru.updateScript` plus top-level `updateScript`.
 - The old PR creation path is still nixpkgs/GitHub-specific and should be replaced/generalized before real forge automation.

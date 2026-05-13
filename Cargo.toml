@@ -1,0 +1,8 @@
+[package]
+name = "bumpkin"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Small Rust updater/PR steward for Nix flake package sets"
+
+[dependencies]

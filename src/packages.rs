@@ -142,7 +142,7 @@ fn by_maintainer_source_scan(root: &Path, maintainer: &str) -> Result<Vec<Candid
     for file in files {
         let text =
             fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
-        if !text.contains(maintainer) {
+        if !has_maintainer(&text, maintainer) {
             continue;
         }
         out.push(Candidate {
@@ -218,6 +218,72 @@ fn without_line_comments(text: &str) -> String {
         .filter(|line| !line.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Check whether `maintainer` appears inside a `maintainers = [...]` block.
+///
+/// This avoids false positives from maintainer handles that show up in URLs,
+/// comments, or source strings outside the maintainers declaration.
+///
+/// Handles both `maintainers = [ ... ]` and `maintainers = with lib.maintainers; [ ... ]`.
+fn has_maintainer(text: &str, maintainer: &str) -> bool {
+    let mut rest = text;
+    while let Some(pos) = rest.find("maintainers") {
+        rest = &rest[pos + "maintainers".len()..];
+
+        // Scan forward (up to 1000 chars) to find a maintainer list `[...]`.
+        // Skip over intermediate `;` characters that separate non-list
+        // references (e.g. `lib.maintainers`).
+        let mut scan = rest;
+        loop {
+            let window = &scan[..scan.len().min(1000)];
+            let semi = window.find(';');
+            let bracket = window.find('[');
+
+            match (semi, bracket) {
+                (Some(s), Some(b)) if s < b => {
+                    // ';' before '[' → a reference like `lib.maintainers`.
+                    // Skip past the ';' and keep scanning.
+                    scan = &scan[s + 1..];
+                }
+                (_, Some(b)) => {
+                    // '[' comes before any ';' (or there is no ';').
+                    // This is the maintainers declaration list.
+                    let content = &scan[b + 1..];
+                    let mut depth = 1;
+                    let mut end = 0;
+                    for (i, ch) in content.char_indices() {
+                        match ch {
+                            '[' => depth += 1,
+                            ']' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    end = i;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if content[..end].contains(maintainer) {
+                        return true;
+                    }
+                    rest = &scan[b + 1 + end..];
+                    break;
+                }
+                (Some(s), None) => {
+                    // Only ';', no '[' in window. Skip past this occurrence.
+                    rest = &scan[s + 1..];
+                    break;
+                }
+                (None, None) => {
+                    // Neither '[' nor ';' in window. Give up.
+                    return false;
+                }
+            }
+        }
+    }
+    false
 }
 
 const FETCHERS: &[(&str, &str)] = &[
@@ -373,5 +439,49 @@ mod tests {
                 "/nix/store/source/pkgs/by-name/fo/foo/package.nix"
             ))
         );
+    }
+
+    #[test]
+    fn has_maintainer_finds_handle_in_maintainers_list() {
+        assert!(has_maintainer(
+            "maintainers = with lib.maintainers; [ 74k1 jtojnar ];",
+            "74k1"
+        ));
+    }
+
+    #[test]
+    fn has_maintainer_avoids_false_positive_in_urls() {
+        // A maintainer handle that appears in a URL or comment outside the
+        // maintainers list should not match.
+        assert!(!has_maintainer(
+            "url = \"https://github.com/74k1/tixpkgs\";\nmaintainers = with lib.maintainers; [ jtojnar ];",
+            "74k1"
+        ));
+    }
+
+    #[test]
+    fn has_maintainer_finds_handle_in_multiple_blocks() {
+        assert!(has_maintainer(
+            "maintainers = [ someone ];\n# other stuff\nmaintainers = [ 74k1 ];",
+            "74k1"
+        ));
+    }
+
+    #[test]
+    fn has_maintainer_handles_lib_reference() {
+        // `lib.maintainers` is a reference, not a declaration. The actual
+        // maintainers list follows after the `;` in a second `[ ... ]`.
+        assert!(has_maintainer(
+            "maintainers = with lib.maintainers; [ 74k1 jtojnar ];",
+            "74k1"
+        ));
+    }
+
+    #[test]
+    fn has_maintainer_returns_false_for_empty_list() {
+        assert!(!has_maintainer(
+            "maintainers = [ ];",
+            "74k1"
+        ));
     }
 }

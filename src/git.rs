@@ -77,6 +77,55 @@ pub fn commit_paths(
     }
 }
 
+pub fn current_branch(root: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("git branch --show-current: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+pub fn checkout_branch(root: &Path, branch: &str) -> Result<(), String> {
+    run(root, &["checkout", "-f", branch])
+}
+
+pub fn create_branch(root: &Path, branch: &str) -> Result<(), String> {
+    run(root, &["checkout", "-b", branch])
+}
+
+pub fn delete_branch(root: &Path, branch: &str) -> Result<(), String> {
+    run(root, &["branch", "-D", branch])
+}
+
+pub fn reset_hard(root: &Path, refspec: &str) -> Result<(), String> {
+    run(root, &["reset", "--hard", refspec])
+}
+
+pub fn push_branch(root: &Path, branch: &str) -> Result<(), String> {
+    run(root, &["push", "origin", branch])
+}
+
+pub fn pull_ff_only(root: &Path) -> Result<(), String> {
+    run(root, &["pull", "--ff-only"])
+}
+
+/// Get the fetch URL of the `origin` remote.
+pub fn remote_url(root: &Path) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("git remote get-url: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 pub fn status(cmd: &mut Command) -> Result<bool, String> {
     cmd.status()
         .map(|s| s.success())

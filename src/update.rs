@@ -5,13 +5,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{git, nix, packages};
+use crate::{forge, git, nix, packages, repology};
 
 pub struct CommitOptions {
     pub commit: bool,
     pub signed: bool,
+    pub push: bool,
+    pub pr: bool,
     pub signing_key: Option<String>,
     pub gpg_format: Option<String>,
+    pub forge: String,
+    pub forge_api_url: Option<String>,
 }
 
 pub fn dry_run_package(root: &Path, package: &str) -> Result<(), String> {
@@ -37,11 +41,44 @@ pub fn dry_run_package(root: &Path, package: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn update_maintainer(root: &Path, maintainer: &str) -> Result<(), String> {
+pub fn update_maintainer(
+    root: &Path,
+    maintainer: &str,
+    commit: &CommitOptions,
+    skip: &[String],
+) -> Result<(), String> {
+    let main_branch = git::current_branch(root)?;
+
+    if commit.commit && !git::clean(root)? {
+        return Err(
+            "working tree has uncommitted or untracked changes; commit/stash them before update"
+                .to_string(),
+        );
+    }
+
     let candidates = packages::by_maintainer(root, maintainer)?;
+    // Also check BUMPKIN_SKIP env var for per-machine blocklist (comma-separated).
+    let env_skip: Vec<String> = std::env::var("BUMPKIN_SKIP")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .collect();
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|c| !skip.iter().any(|s| c.attr_path == *s))
+        .filter(|c| !env_skip.iter().any(|s| c.attr_path == *s))
+        .collect();
     if candidates.is_empty() {
         println!("No packages found for maintainer `{maintainer}`.");
         return Ok(());
+    }
+
+    // Ensure we're on the main branch and up to date at the start.
+    if commit.commit {
+        println!("=== syncing main branch ===");
+        git::checkout_branch(root, &main_branch)?;
+        git::pull_ff_only(root)?;
     }
 
     let mut summary = BatchSummary::default();
@@ -57,24 +94,52 @@ pub fn update_maintainer(root: &Path, maintainer: &str) -> Result<(), String> {
             continue;
         }
 
-        match batch_update_one(root, &candidate.attr_path) {
-            Ok(BatchOutcome::NoChanges) => {
-                println!("no changes");
-                summary.no_changes += 1;
+        if commit.commit {
+            // Per-package branch flow: branch -> update -> build -> commit -> push -> cleanup.
+            match commit_update_one(root, &main_branch, &candidate.attr_path, commit) {
+                Ok(BatchOutcome::NoChanges) => {
+                    println!("no changes");
+                    summary.no_changes += 1;
+                }
+                Ok(BatchOutcome::UpdatedBuildOk) => {
+                    println!("committed: build ok");
+                    summary.updated += 1;
+                }
+                Ok(BatchOutcome::UpdatedBuildFailed) => {
+                    println!("committed: build failed");
+                    summary.build_failed += 1;
+                }
+                Err(err) => {
+                    println!("failed: {err}");
+                    summary.failed += 1;
+                }
             }
-            Ok(BatchOutcome::UpdatedBuildOk) => {
-                println!("updated: build ok");
-                summary.updated += 1;
-            }
-            Ok(BatchOutcome::UpdatedBuildFailed) => {
-                println!("updated: build failed");
-                summary.build_failed += 1;
-            }
-            Err(err) => {
-                println!("failed: {err}");
-                summary.failed += 1;
+        } else {
+            // Temp worktree flow (current behavior).
+            match batch_update_one(root, &candidate.attr_path) {
+                Ok(BatchOutcome::NoChanges) => {
+                    println!("no changes");
+                    summary.no_changes += 1;
+                }
+                Ok(BatchOutcome::UpdatedBuildOk) => {
+                    println!("updated: build ok");
+                    summary.updated += 1;
+                }
+                Ok(BatchOutcome::UpdatedBuildFailed) => {
+                    println!("updated: build failed");
+                    summary.build_failed += 1;
+                }
+                Err(err) => {
+                    println!("failed: {err}");
+                    summary.failed += 1;
+                }
             }
         }
+    }
+
+    // Return to the main branch.
+    if commit.commit {
+        let _ = git::checkout_branch(root, &main_branch);
     }
 
     println!("\n--- summary ---");
@@ -84,6 +149,110 @@ pub fn update_maintainer(root: &Path, maintainer: &str) -> Result<(), String> {
     println!("failed: {}", summary.failed);
     println!("skipped: {}", summary.skipped);
     Ok(())
+}
+
+/// Commit-mode: branch off main, update in-place, build, commit, optionally push.
+fn commit_update_one(
+    root: &Path,
+    main_branch: &str,
+    package: &str,
+    commit: &CommitOptions,
+) -> Result<BatchOutcome, String> {
+    // Ensure a clean starting point on main.
+    git::checkout_branch(root, main_branch)?;
+    if !git::clean(root)? {
+        git::reset_hard(root, &format!("origin/{main_branch}"))?;
+    }
+
+    let branch_name = format!("bumpkin/{package}");
+    // Remove any leftover branch from a previous run.
+    let _ = git::delete_branch(root, &branch_name);
+    git::create_branch(root, &branch_name)?;
+
+    let old_version =
+        nix::package_version(root, package).unwrap_or_else(|_| "unknown".to_string());
+
+    run_update_script(root, package)?;
+
+    if git::clean(root)? {
+        git::checkout_branch(root, main_branch)?;
+        let _ = git::delete_branch(root, &branch_name);
+        return Ok(BatchOutcome::NoChanges);
+    }
+
+    let changed_paths = git::changed_paths(root)?;
+    let new_version =
+        nix::package_version(root, package).unwrap_or_else(|_| "unknown".to_string());
+    let title = pr_title(package, &old_version, &new_version);
+
+    println!("diffstat:");
+    git::print_diff_stat(root)?;
+
+    let (build_ok, build_log) = nix::build_package_with_log(root, package)?;
+
+    if let Some(format) = commit.gpg_format.as_deref() {
+        git::run(root, &["config", "gpg.format", format])?;
+    }
+    if let Some(key) = commit.signing_key.as_deref() {
+        git::run(root, &["config", "user.signingkey", key])?;
+    }
+    let (nixpkgs_input, nixpkgs_rev) = nix::flake_input_info(root).unwrap_or_default();
+    let nixpkgs_in = if nixpkgs_input.is_empty() { None } else { Some(nixpkgs_input.as_str()) };
+    let nixpkgs_rv = if nixpkgs_rev.is_empty() { None } else { Some(nixpkgs_rev.as_str()) };
+    let body = pr_body(package, &old_version, &new_version, build_ok, Some(&build_log), nixpkgs_in, nixpkgs_rv);
+    git::commit_paths(root, &changed_paths, &title, &body, commit.signed)?;
+
+    if commit.push {
+        match git::push_branch(root, &branch_name) {
+            Ok(()) => {
+                println!("pushed branch {branch_name}");
+                if commit.pr {
+                    let token = std::env::var("GITHUB_TOKEN").ok();
+                    let remote_url = git::remote_url(root)?;
+                    let forge_backend = forge::resolve(
+                        &commit.forge,
+                        commit.forge_api_url.as_deref(),
+                        token.as_deref(),
+                        &remote_url,
+                    );
+                    match forge_backend {
+                        Ok(backend) => {
+                            let (owner, repo) = owner_repo_from_url(&remote_url)?;
+                            match backend.find_existing_pr(root, &branch_name, main_branch, &owner, &repo) {
+                                Ok(Some(pr_num)) => {
+                                    println!("PR #{pr_num} already exists for {branch_name}, skipping.");
+                                }
+                                Ok(None) => {
+                                    println!("opening PR for {package}...");
+                                    match backend.create_pr(root, &branch_name, main_branch, &title, &body, &owner, &repo) {
+                                        Ok(url) => println!("PR created: {url}"),
+                                        Err(err) => println!("warning: PR creation failed: {err}"),
+                                    }
+                                }
+                                Err(err) => println!("warning: find existing PR failed: {err}"),
+                            }
+                        }
+                        Err(err) => println!("warning: forge backend not available: {err}"),
+                    }
+                }
+            }
+            Err(err) => {
+                println!("warning: push failed: {err}");
+            }
+        }
+    }
+
+    let outcome = if build_ok {
+        BatchOutcome::UpdatedBuildOk
+    } else {
+        BatchOutcome::UpdatedBuildFailed
+    };
+
+    // Return to main and delete the per-package branch.
+    // Force-checkout discards any uncommitted changes (from failed builds, etc.).
+    git::checkout_branch(root, main_branch)?;
+    let _ = git::delete_branch(root, &branch_name);
+    Ok(outcome)
 }
 
 fn batch_update_one(root: &Path, package: &str) -> Result<BatchOutcome, String> {
@@ -132,10 +301,9 @@ pub fn update_package(root: &Path, package: &str, commit: CommitOptions) -> Resu
     }
 
     let new_version = nix::package_version(root, package).unwrap_or_else(|_| "unknown".to_string());
-    let (title, body) = pr_text(package, &old_version, &new_version);
+    let title = pr_title(package, &old_version, &new_version);
 
     println!("\n--- suggested PR title ---\n{title}");
-    println!("\n--- suggested PR body ---\n{body}");
     println!("\n--- diffstat ---");
     git::print_diff_stat(root)?;
 
@@ -143,6 +311,11 @@ pub fn update_package(root: &Path, package: &str, commit: CommitOptions) -> Resu
     if !nix::build_package(root, package)? {
         return Err("build failed; leaving changes in working tree".to_string());
     }
+    let (nixpkgs_input, nixpkgs_rev) = nix::flake_input_info(root).unwrap_or_default();
+    let nixpkgs_in = if nixpkgs_input.is_empty() { None } else { Some(nixpkgs_input.as_str()) };
+    let nixpkgs_rv = if nixpkgs_rev.is_empty() { None } else { Some(nixpkgs_rev.as_str()) };
+    let body = pr_body(package, &old_version, &new_version, true, None, nixpkgs_in, nixpkgs_rv);
+    println!("\n--- suggested PR body ---\n{body}");
 
     if commit.commit {
         if let Some(format) = commit.gpg_format.as_deref() {
@@ -233,19 +406,59 @@ fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
         }
     } else if text.contains("fetchurl") || text.contains("fetchzip") {
         let url = extract_assignment(&text, "url").ok_or("could not find fetchurl/fetchzip url")?;
-        let (owner, repo, prefix) = github_release_from_url(&url).ok_or("native fetchurl support currently requires a GitHub releases/download URL containing ${version} or ${finalAttrs.version}")?;
-        NativeSource::GitHubReleaseAsset {
-            owner,
-            repo,
-            prefix,
-            url_template: url,
-            unpack: text.contains("fetchzip"),
+        if let Some((owner, repo, prefix)) = github_release_from_url(&url) {
+            NativeSource::GitHubReleaseAsset {
+                owner,
+                repo,
+                prefix,
+                url_template: url,
+                unpack: text.contains("fetchzip"),
+            }
+        } else if let Some((host, owner, repo, prefix)) = gitlab_from_url(&url) {
+            NativeSource::GitLabTag { host, owner, repo, prefix }
+        } else if let Some((host, owner, repo, prefix)) = sourcehut_from_url(&url) {
+            NativeSource::SourcehutTag { host, owner, repo, prefix }
+        } else {
+            // Consult repology before giving up on unrecognised fetchurl patterns.
+            if let Some(pname) = extract_assignment(&text, "pname") {
+                if let Some(repology_ver) = repology::latest_version(&pname) {
+                    if repology_ver != old_version {
+                        println!("Repology: {pname} latest is {repology_ver} (nix has {old_version})");
+                        return Err(format!(
+                            "Repology knows {pname} = {repology_ver} but fetchurl pattern is unrecognised; add an updateScript"
+                        ));
+                    }
+                }
+            }
+            return Err("native fetchurl does not recognise this URL pattern (GitHub releases, GitLab API, sourcehut git)".to_string());
         }
+    } else if text.contains("fetchgit") || text.contains("fetchGit") {
+        let url = extract_assignment(&text, "url").ok_or("could not find fetchgit url")?;
+        NativeSource::FetchGit { url }
     } else {
-        return Err("native updater currently supports fetchFromGitHub and GitHub release fetchurl/fetchzip only".to_string());
+        // Last resort: consult repology for a version hint.
+        if let Some(pname) = extract_assignment(&text, "pname") {
+            if let Some(repology_ver) = repology::latest_version(&pname) {
+                if repology_ver != old_version {
+                    println!("Repology: {pname} latest is {repology_ver} (nix has {old_version})");
+                    return Err(format!(
+                        "Repology knows {pname} = {repology_ver} but no native updater supports this fetcher; add an updateScript"
+                    ));
+                }
+            }
+        }
+        return Err("native updater currently supports fetchFromGitHub, fetchGit, GitHub/GitLab/sourcehut fetchurl; add updateScript for everything else".to_string());
     };
 
-    let latest = latest_github_tag(source.owner(), source.repo(), source.prefix(), &old_version)?;
+    let latest = match &source {
+        NativeSource::GitLabTag { host, owner, repo, prefix } =>
+            latest_gitlab_tag(host, owner, repo, prefix)?,
+        NativeSource::SourcehutTag { host, owner, repo, prefix } =>
+            latest_sourcehut_tag(host, owner, repo, prefix)?,
+        NativeSource::FetchGit { url } =>
+            latest_fetchgit_tag(url)?,
+        _ => latest_github_tag(source.owner(), source.repo(), source.prefix(), &old_version)?,
+    };
     if latest == old_version {
         println!("Already at latest detected version {latest}.");
         return Ok(());
@@ -317,24 +530,45 @@ enum NativeSource {
         url_template: String,
         unpack: bool,
     },
+    GitLabTag {
+        host: String,
+        owner: String,
+        repo: String,
+        prefix: String,
+    },
+    SourcehutTag {
+        host: String,
+        owner: String,
+        repo: String,
+        prefix: String,
+    },
+    FetchGit {
+        url: String,
+    },
 }
 
 impl NativeSource {
     fn owner(&self) -> &str {
         match self {
-            Self::GitHubArchive { owner, .. } | Self::GitHubReleaseAsset { owner, .. } => owner,
+            Self::GitHubArchive { owner, .. } | Self::GitHubReleaseAsset { owner, .. }
+            | Self::GitLabTag { owner, .. } | Self::SourcehutTag { owner, .. } => owner,
+            Self::FetchGit { .. } => "unknown",
         }
     }
 
     fn repo(&self) -> &str {
         match self {
-            Self::GitHubArchive { repo, .. } | Self::GitHubReleaseAsset { repo, .. } => repo,
+            Self::GitHubArchive { repo, .. } | Self::GitHubReleaseAsset { repo, .. }
+            | Self::GitLabTag { repo, .. } | Self::SourcehutTag { repo, .. } => repo,
+            Self::FetchGit { .. } => "unknown",
         }
     }
 
     fn prefix(&self) -> &str {
         match self {
-            Self::GitHubArchive { prefix, .. } | Self::GitHubReleaseAsset { prefix, .. } => prefix,
+            Self::GitHubArchive { prefix, .. } | Self::GitHubReleaseAsset { prefix, .. }
+            | Self::GitLabTag { prefix, .. } | Self::SourcehutTag { prefix, .. } => prefix,
+            Self::FetchGit { .. } => "",
         }
     }
 
@@ -353,6 +587,9 @@ impl NativeSource {
                 unpack,
                 ..
             } => prefetch_url(&render_version_template(url_template, version), *unpack),
+            Self::GitLabTag { .. } | Self::SourcehutTag { .. } | Self::FetchGit { .. } => {
+                Err("git-based sources must be updated via updateScript".to_string())
+            }
         }
     }
 }
@@ -394,7 +631,7 @@ fn latest_github_tag(
 }
 
 fn prefetch_url(url: &str, unpack: bool) -> Result<String, String> {
-    let mut cmd = Command::new("nix");
+    let mut cmd = crate::nix::nix_cmd();
     cmd.args(["store", "prefetch-file", "--json"]);
     if unpack {
         cmd.arg("--unpack");
@@ -424,6 +661,120 @@ fn render_version_template(template: &str, version: &str) -> String {
     template
         .replace("${version}", version)
         .replace("${finalAttrs.version}", version)
+}
+
+/// Extract (owner, repo) from a git remote URL.
+fn owner_repo_from_url(url: &str) -> Result<(String, String), String> {
+    let (_, owner, repo) = forge::parse_repo_url(url)?;
+    Ok((owner, repo))
+}
+
+/// Recognise GitLab release asset URLs.
+fn gitlab_from_url(url: &str) -> Option<(String, String, String, String)> {
+    let rest = url.strip_prefix("https://")?;
+    let (host, rest) = rest.split_once('/')?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts: Vec<&str> = rest.split('/').collect();
+    // Filter path segments: remove common GitLab suffixes
+    parts.retain(|p| *p != "-" && !p.starts_with("archive") && !p.starts_with("releases"));
+    if parts.len() < 2 { return None; }
+    let owner = parts[0].to_string();
+    let repo = parts[1].to_string();
+    let prefix = if url.contains("${version}") { version_prefix(url) } else { "v".to_string() };
+    Some((host.to_string(), owner, repo, prefix))
+}
+
+/// Recognise sourcehut git URLs.
+fn sourcehut_from_url(url: &str) -> Option<(String, String, String, String)> {
+    let rest = url.strip_prefix("https://")?;
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let (host, rest) = rest.split_once('/')?;
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.len() < 2 { return None; }
+    let owner = parts[0].to_string();
+    let repo = parts[1].to_string();
+    let prefix = if url.contains("${version}") { version_prefix(url) } else { "v".to_string() };
+    Some((host.to_string(), owner, repo, prefix))
+}
+
+/// Fetch latest tag from a GitLab project via the API v4.
+fn latest_gitlab_tag(host: &str, owner: &str, repo: &str, prefix: &str) -> Result<String, String> {
+    let project = format!("{owner}%2F{repo}");
+    let url = format!("https://{host}/api/v4/projects/{project}/repository/tags?per_page=20&order_by=name&sort=desc");
+    let out = Command::new("curl")
+        .args(["-fsSL", "--max-time", "15", &url])
+        .output()
+        .map_err(|e| format!("fetch GitLab tags: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("GitLab API returned {}", out.status));
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    for line in body.lines() {
+        if let Some(tag_start) = line.find("\"name\":\"") {
+            let tag = &line[tag_start + 8..];
+            if let Some(tag_end) = tag.find('"') {
+                let tag = &tag[..tag_end];
+                if tag.starts_with(prefix) {
+                    let ver = &tag[prefix.len()..];
+                    if parse_version(ver).is_some() {
+                        return Ok(ver.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Err("no version tag found on GitLab".to_string())
+}
+
+/// Fetch latest tag from a sourcehut repo via git ls-remote.
+fn latest_sourcehut_tag(host: &str, owner: &str, repo: &str, prefix: &str) -> Result<String, String> {
+    let url = format!("https://git.{host}/{owner}/{repo}");
+    let out = Command::new("git")
+        .args(["ls-remote", "--tags", "--refs", &url])
+        .output()
+        .map_err(|e| format!("ls-remote sourcehut: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git ls-remote returned {}", out.status));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut versions: Vec<(Vec<u64>, String)> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(tag) = line.rsplit('/').next() {
+            if tag.starts_with(prefix) {
+                let ver = &tag[prefix.len()..];
+                if let Some(p) = parse_version(ver) {
+                    versions.push((p, ver.to_string()));
+                }
+            }
+        }
+    }
+    versions.sort_by(|a, b| b.0.cmp(&a.0));
+    versions.first().map(|(_, v)| v.clone()).ok_or("no version tag found on sourcehut".to_string())
+}
+
+/// Fetch latest version tag from a fetchgit repo via git ls-remote.
+fn latest_fetchgit_tag(url: &str) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["ls-remote", "--tags", "--refs", url])
+        .output()
+        .map_err(|e| format!("ls-remote fetchgit: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git ls-remote returned {}", out.status));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut versions: Vec<(Vec<u64>, String)> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(tag) = line.rsplit('/').next() {
+            let ver = tag.trim_start_matches(|c: char| c == 'v' || c == 'V' || !c.is_ascii_digit());
+            if let Some(p) = parse_version(ver) {
+                if !p.is_empty() {
+                    versions.push((p, tag.to_string()));
+                }
+            }
+        }
+    }
+    versions.sort_by(|a, b| b.0.cmp(&a.0));
+    versions.first().map(|(_, v)| v.clone()).ok_or("no version tag found".to_string())
 }
 
 fn github_release_from_url(url: &str) -> Option<(String, String, String)> {
@@ -462,7 +813,7 @@ fn replace_src_hash(text: &str, new_hash: &str) -> Result<String, String> {
 }
 
 fn dependency_hash_keys(text: &str) -> Vec<&'static str> {
-    ["cargoHash", "vendorHash", "npmDepsHash"]
+    ["cargoHash", "vendorHash", "npmDepsHash", "yarnHash", "pomHash", "mvnHash", "mixHash", "nugetHash", "dotnetHash"]
         .into_iter()
         .filter(|key| text.contains(&format!("{key} = \"")))
         .collect()
@@ -485,7 +836,7 @@ fn replace_dep_hashes_with_fake(text: &str, keys: &[&str]) -> String {
 }
 
 fn build_and_extract_wanted_hashes(root: &Path, package: &str) -> Result<Vec<String>, String> {
-    let out = Command::new("nix")
+    let out = crate::nix::nix_cmd()
         .args([
             "build",
             "--no-link",
@@ -526,17 +877,54 @@ fn version_gt(a: &str, b: &str) -> bool {
     parse_version(a) > parse_version(b)
 }
 
-fn pr_text(package: &str, old_version: &str, new_version: &str) -> (String, String) {
-    let title =
-        if old_version != "unknown" && new_version != "unknown" && old_version != new_version {
-            format!("{package}: {old_version} -> {new_version}")
-        } else {
-            format!("{package}: update")
-        };
-    let body = format!(
-        "Updates `{package}` from `{old_version}` to `{new_version}`.\n\nGenerated by bumpkin."
+fn pr_title(package: &str, old_version: &str, new_version: &str) -> String {
+    format!("feat({package}): {old_version} -> {new_version}")
+}
+
+fn pr_body(
+    package: &str,
+    old_version: &str,
+    new_version: &str,
+    build_ok: bool,
+    build_log: Option<&str>,
+    nixpkgs_input: Option<&str>,
+    nixpkgs_rev: Option<&str>,
+) -> String {
+    let current = current_platform();
+    let mut body = format!(
+        "Update `{package}` from `{old_version}` to `{new_version}`.\n\n\
+         **Built on platform:** `{current}` ([x] build ok)\n\n"
     );
-    (title, body)
+    if let Some(input) = nixpkgs_input {
+        if let Some(rev) = nixpkgs_rev {
+            body.push_str(&format!("**Flake:** `{input}` at `{rev}`\n\n"));
+        } else {
+            body.push_str(&format!("**Flake:** `{input}`\n\n"));
+        }
+    }
+    body.push_str("Generated by [bumpkin](https://github.com/74k1/bumpkin).");
+    if !build_ok {
+        body = format!("⚠️ Build failed on {current}.\n\n{body}");
+        if let Some(log) = build_log {
+            // Grab the last ~20 lines of the build log.
+            let tail: Vec<&str> = log.lines().rev().take(20).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            body.push_str("\n\n<details>\n<summary>Build log (last 20 lines)</summary>\n\n```\n");
+            body.push_str(&tail.join("\n"));
+            body.push_str("\n```\n</details>\n");
+        }
+    }
+    body
+}
+
+fn current_platform() -> &'static str {
+    match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("x86_64", "linux") => "x86_64-linux",
+        ("aarch64", "linux") => "aarch64-linux",
+        ("x86_64", "macos") => "x86_64-darwin",
+        ("aarch64", "macos") => "aarch64-darwin",
+        _ => "unknown",
+    }
 }
 
 struct TempWorktree {

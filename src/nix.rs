@@ -2,6 +2,12 @@ use std::{path::Path, process::Command};
 
 use crate::git;
 
+pub(crate) fn nix_cmd() -> Command {
+    let mut cmd = Command::new("nix");
+    cmd.args(["--extra-experimental-features", "nix-command flakes"]);
+    cmd
+}
+
 #[derive(Debug)]
 pub struct EvaluatedPackage {
     pub attr_path: String,
@@ -10,7 +16,7 @@ pub struct EvaluatedPackage {
 }
 
 pub fn package_version(root: &Path, package: &str) -> Result<String, String> {
-    let out = Command::new("nix")
+    let out = nix_cmd()
         .args([
             "eval",
             "--raw",
@@ -27,11 +33,60 @@ pub fn package_version(root: &Path, package: &str) -> Result<String, String> {
 }
 
 pub fn build_package(root: &Path, package: &str) -> Result<bool, String> {
-    git::status(Command::new("nix").args([
+    git::status(nix_cmd().args([
         "build",
         "--no-link",
         &format!("path:{}#{package}", root.display()),
     ]))
+}
+
+/// Build and capture full output (for diagnostics in PR bodies).
+pub fn build_package_with_log(
+    root: &Path,
+    package: &str,
+) -> Result<(bool, String), String> {
+    let out = nix_cmd()
+        .args([
+            "build",
+            "--no-link",
+            &format!("path:{}#{package}", root.display()),
+        ])
+        .output()
+        .map_err(|e| format!("run nix build: {e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    Ok((out.status.success(), format!("{stdout}{stderr}")))
+}
+
+/// Collect key flake metadata for PR bodies: nixpkgs input name and rev.
+pub fn flake_input_info(root: &Path) -> Result<(String, String), String> {
+    if !root.join("flake.nix").exists() {
+        return Ok((String::new(), String::new()));
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {}: {e}", root.display()))?;
+    let expr = flake_input_info_expr(&format!("path:{}", root.display()));
+    let out = nix_cmd()
+        .args(["eval", "--raw", "--impure", "--expr", &expr])
+        .current_dir(&root)
+        .output()
+        .map_err(|e| format!("eval flake input info: {e}"))?;
+    if !out.status.success() {
+        return Ok((String::new(), String::new()));
+    }
+    let stdout = String::from_utf8(out.stdout)
+        .map_err(|e| format!("decode flake input info: {e}"))?;
+    let mut input = String::new();
+    let mut rev = String::new();
+    for line in stdout.lines() {
+        if let Some(r) = line.strip_prefix("input\t") {
+            input = r.to_string();
+        } else if let Some(r) = line.strip_prefix("rev\t") {
+            rev = r.to_string();
+        }
+    }
+    Ok((input, rev))
 }
 
 pub fn build_update_script(root: &Path, package: &str) -> Result<String, String> {
@@ -43,7 +98,7 @@ pub fn build_update_script(root: &Path, package: &str) -> Result<String, String>
         .canonicalize()
         .map_err(|e| format!("canonicalize {}: {e}", root.display()))?;
     let expr = update_script_expr(&format!("path:{}", root.display()), package);
-    let out = Command::new("nix")
+    let out = nix_cmd()
         .args([
             "build",
             "--no-link",
@@ -77,7 +132,7 @@ pub fn packages_by_maintainer(
         .canonicalize()
         .map_err(|e| format!("canonicalize {}: {e}", root.display()))?;
     let expr = maintainer_query_expr(&format!("path:{}", root.display()), maintainer);
-    let out = Command::new("nix")
+    let out = nix_cmd()
         .args(["eval", "--raw", "--impure", "--expr", &expr])
         .current_dir(&root)
         .output()
@@ -116,9 +171,15 @@ let
   system = builtins.currentSystem;
   flakePackages = flake.packages.${{system}} or {{}};
   legacyPackages = flake.legacyPackages.${{system}} or {{}};
+  inputNames = builtins.attrNames (flake.inputs or {{}});
   wrapperPkgs =
     if legacyPackages ? writeShellScriptBin then legacyPackages
-    else if flake.inputs ? nixpkgs then import flake.inputs.nixpkgs {{ inherit system; }}
+    else let
+      pkgsInputs = builtins.filter (name:
+        let input = flake.inputs.${{name}} or {{}};
+        in input ? outPath && (import input {{}}).writeShellScriptBin or null != null
+      ) inputNames;
+    in if pkgsInputs != [] then import flake.inputs.${{builtins.head pkgsInputs}} {{ inherit system; }}
     else null;
   package = flakePackages."{package}" or legacyPackages."{package}" or (throw "package `{package}` not found");
   script =
@@ -136,7 +197,7 @@ let
       if value == [] then throw "empty updateScript list"
       else if wrapperPkgs != null && wrapperPkgs ? writeShellScriptBin then
         wrapperPkgs.writeShellScriptBin "bumpkin-update-script" (builtins.concatStringsSep " " (map (part: quote (scriptPart part)) value))
-      else builtins.head value
+      else throw "updateScript is a list but no nixpkgs-like input found for writeShellScriptBin; add a nixpkgs input or legacyPackages"
     else value;
 in normalize script
 "#,
@@ -205,6 +266,26 @@ in builtins.concatStringsSep "\n" (map lineFor matchingNames)
 "#,
         flake_ref = escape_nix_string(flake_ref),
         maintainer = escape_nix_string(maintainer)
+    )
+}
+
+fn flake_input_info_expr(flake_ref: &str) -> String {
+    format!(
+        r#"
+let
+  flake = builtins.getFlake "{flake_ref}";
+  inputNames = builtins.attrNames (flake.inputs or {{}});
+  nixpkgsName = builtins.head (
+    builtins.filter (name:
+      let input = flake.inputs.${{name}} or {{}};
+      in input ? rev && input ? outPath && (import input {{ system = builtins.currentSystem; }}).stdenv or null != null
+    ) inputNames
+  );
+  rev = if nixpkgsName != null then flake.inputs.${{nixpkgsName}}.rev or "" else "";
+in "input\t" + (if nixpkgsName != null then nixpkgsName else "")
+  + "\nrev\t" + rev
+"#,
+        flake_ref = escape_nix_string(flake_ref)
     )
 }
 

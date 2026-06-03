@@ -1,3 +1,5 @@
+pub(crate) mod forge;
+pub(crate) mod repology;
 mod git;
 mod nix;
 pub(crate) mod packages;
@@ -12,9 +14,14 @@ struct Options {
     maintainer: Option<String>,
     commit: bool,
     signed: bool,
+    push: bool,
+    pr: bool,
+    skip: Vec<String>,
     signing_key: Option<String>,
     gpg_format: Option<String>,
     json: bool,
+    forge: Option<String>,
+    forge_api_url: Option<String>,
 }
 
 pub fn run() -> Result<(), String> {
@@ -35,7 +42,10 @@ pub fn run() -> Result<(), String> {
             if let Some(package) = opts.package.as_deref() {
                 update::dry_run_package(&opts.root, package)
             } else if let Some(maintainer) = opts.maintainer.as_deref() {
-                let candidates = packages::by_maintainer(&opts.root, maintainer)?;
+                let candidates: Vec<_> = packages::by_maintainer(&opts.root, maintainer)?
+                    .into_iter()
+                    .filter(|c| !opts.skip.iter().any(|s| c.attr_path == *s))
+                    .collect();
                 if candidates.is_empty() {
                     println!("No packages found for maintainer `{maintainer}`.");
                 }
@@ -84,17 +94,30 @@ pub fn run() -> Result<(), String> {
                     update::CommitOptions {
                         commit: opts.commit,
                         signed: opts.signed,
+                        push: false,
+                        pr: false,
                         signing_key: opts.signing_key,
                         gpg_format: opts.gpg_format,
+                        forge: opts.forge.clone().unwrap_or_else(|| "auto".to_string()),
+                        forge_api_url: opts.forge_api_url.clone(),
                     },
                 )
             } else if let Some(maintainer) = opts.maintainer.as_deref() {
-                if opts.commit {
-                    return Err(
-                        "batch update --maintainer does not support --commit yet".to_string()
-                    );
-                }
-                update::update_maintainer(&opts.root, maintainer)
+                update::update_maintainer(
+                    &opts.root,
+                    maintainer,
+                    &update::CommitOptions {
+                        commit: opts.commit,
+                        signed: opts.signed,
+                        push: opts.push,
+                        pr: opts.pr,
+                        signing_key: opts.signing_key.clone(),
+                        gpg_format: opts.gpg_format.clone(),
+                        forge: opts.forge.clone().unwrap_or_else(|| "auto".to_string()),
+                        forge_api_url: opts.forge_api_url.clone(),
+                    },
+                    &opts.skip,
+                )
             } else {
                 Err("update needs --package <attr> or --maintainer <name>".to_string())
             }
@@ -150,6 +173,15 @@ fn apply_config(opts: &mut Options, config: config::Config) {
     if let Some(commit) = config.commit {
         opts.commit = commit;
     }
+    if let Some(push) = config.push {
+        opts.push = push;
+    }
+    if let Some(pr) = config.pr {
+        opts.pr = pr;
+    }
+    if let Some(skip) = config.skip {
+        opts.skip = skip;
+    }
     if let Some(signed) = config.signed {
         opts.signed = signed;
     }
@@ -158,6 +190,12 @@ fn apply_config(opts: &mut Options, config: config::Config) {
     }
     if let Some(gpg_format) = config.gpg_format {
         opts.gpg_format = Some(gpg_format);
+    }
+    if let Some(forge) = config.forge {
+        opts.forge = Some(forge);
+    }
+    if let Some(forge_api_url) = config.forge_api_url {
+        opts.forge_api_url = Some(forge_api_url);
     }
 }
 
@@ -181,6 +219,18 @@ fn parse_options(args: &[String], mut opts: Options) -> Result<Options, String> 
             }
             "--commit" => opts.commit = true,
             "--signed" => opts.signed = true,
+            "--push" => opts.push = true,
+            "--pr" => opts.pr = true,
+            "--skip" => {
+                i += 1;
+                opts.skip = args
+                    .get(i)
+                    .ok_or("missing value for --skip")?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             "--json" => opts.json = true,
             "--signing-key" => {
                 i += 1;
@@ -194,6 +244,15 @@ fn parse_options(args: &[String], mut opts: Options) -> Result<Options, String> 
                 i += 1;
                 opts.gpg_format =
                     Some(args.get(i).ok_or("missing value for --gpg-format")?.clone());
+            }
+            "--forge" => {
+                i += 1;
+                opts.forge = Some(args.get(i).ok_or("missing value for --forge")?.clone());
+            }
+            "--forge-api-url" => {
+                i += 1;
+                opts.forge_api_url =
+                    Some(args.get(i).ok_or("missing value for --forge-api-url")?.clone());
             }
             "--help" | "-h" => return Err(usage()),
             other if other.starts_with('-') => return Err(format!("unknown argument: {other}")),
@@ -254,7 +313,7 @@ fn json_escape(value: &str) -> String {
 }
 
 fn usage() -> String {
-    "usage:\n  bumpkin list [root] --maintainer <name> [--json]\n  bumpkin dry-run [root] --package <attr>\n  bumpkin dry-run [root] --maintainer <name>\n  bumpkin run-update-script [root] --package <attr>\n  bumpkin update [root] --package <attr> [--commit] [--signed]\n  bumpkin update [root] --maintainer <name>\n\n[root] can also be passed as --root <flake> or -C <flake>.".to_string()
+    "usage:\n  bumpkin list [root] --maintainer <name> [--json]\n  bumpkin dry-run [root] --package <attr>\n  bumpkin dry-run [root] --maintainer <name> [--skip pkg1,pkg2]\n  bumpkin run-update-script [root] --package <attr>\n  bumpkin update [root] --package <attr> [--commit] [--signed]\n  bumpkin update [root] --maintainer <name> [--commit] [--signed] [--push] [--pr] [--skip pkg1,pkg2]\n\n[root] can also be passed as --root <flake> or -C <flake>.".to_string()
 }
 
 #[cfg(test)]
@@ -287,7 +346,6 @@ mod config {
     use std::{
         env,
         path::{Path, PathBuf},
-        process::Command,
     };
 
     #[derive(Debug, Default)]
@@ -297,8 +355,13 @@ mod config {
         pub package: Option<String>,
         pub commit: Option<bool>,
         pub signed: Option<bool>,
+        pub push: Option<bool>,
+        pub pr: Option<bool>,
+        pub skip: Option<Vec<String>>,
         pub signing_key: Option<String>,
         pub gpg_format: Option<String>,
+        pub forge: Option<String>,
+        pub forge_api_url: Option<String>,
     }
 
     pub fn load_first() -> Result<Option<Config>, String> {
@@ -340,7 +403,7 @@ mod config {
 
         let expr = config_expr(file_name);
 
-        let out = Command::new("nix")
+        let out = crate::nix::nix_cmd()
             .args(["eval", "--raw", "--impure", "--expr", &expr])
             .current_dir(dir)
             .output()
@@ -379,8 +442,12 @@ in builtins.concatStringsSep "\n" [
   (line "package" (string "package"))
   (line "commit" (bool "commit"))
   (line "signed" (bool "signed"))
+  (line "push" (bool "push"))
+  (line "pr" (bool "pr"))
   (line "signing_key" (string "signingKey"))
   (line "gpg_format" (string "gpgFormat"))
+  (line "forge" (string "forge"))
+  (line "forge_api_url" (string "forgeApiUrl"))
 ]
 "#,
             file_name = escape_nix_path_segment(file_name)
@@ -402,8 +469,12 @@ in builtins.concatStringsSep "\n" [
                 "package" => config.package = Some(value.to_string()),
                 "commit" => config.commit = Some(value == "1"),
                 "signed" => config.signed = Some(value == "1"),
+                "push" => config.push = Some(value == "1"),
+                "pr" => config.pr = Some(value == "1"),
                 "signing_key" => config.signing_key = Some(value.to_string()),
                 "gpg_format" => config.gpg_format = Some(value.to_string()),
+                "forge" => config.forge = Some(value.to_string()),
+                "forge_api_url" => config.forge_api_url = Some(value.to_string()),
                 _ => {}
             }
         }

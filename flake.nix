@@ -9,6 +9,14 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
+      nixosModules = {
+        bumpkin = import ./modules/nixos/bumpkin.nix;
+        default = { config, lib, pkgs, ... }: {
+          imports = [ self.nixosModules.bumpkin ];
+          config.services.bumpkin.package = lib.mkDefault self.packages.${pkgs.system}.default;
+        };
+      };
+
       packages = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; };
         in {

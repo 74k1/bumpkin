@@ -34,12 +34,21 @@ let
 
   bumpkinCmd = "${cfg.package}/bin/bumpkin";
 
+  # Git credential helper that reads the token from the environment, so the
+  # token never lands in remote URLs (.git/config) or on a command line.
+  credentialHelper = pkgs.writeShellScript "bumpkin-git-credential" ''
+    [ "$1" = "get" ] || exit 0
+    [ -n "''${GITHUB_TOKEN:-}" ] || exit 0
+    echo "username=''${BUMPKIN_GIT_USER:-bumpkin}"
+    echo "password=$GITHUB_TOKEN"
+  '';
+
   serviceUnit = maintainer: {
     description = "bumpkin update run for maintainer ${maintainer}";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
 
-    path = [ cfg.package pkgs.git pkgs.nix pkgs.curl pkgs.jq pkgs.gh ]
+    path = [ cfg.package pkgs.git pkgs.nix pkgs.curl pkgs.jq pkgs.gh pkgs.util-linux ]
       ++ lib.optional (cfg.git.gpgFormat == "openpgp" || cfg.gpgKeyFile != null) pkgs.gnupg
       ++ lib.optional (cfg.git.sshKeyFile != null) pkgs.openssh;
 
@@ -49,6 +58,7 @@ let
       Group = cfg.group;
       StateDirectory = "bumpkin";
       RemainAfterExit = false;
+      PrivateTmp = true;
     };
 
     environment = {
@@ -59,6 +69,7 @@ let
       GIT_AUTHOR_EMAIL = cfg.git.userEmail;
       GIT_COMMITTER_NAME = cfg.git.userName;
       GIT_COMMITTER_EMAIL = cfg.git.userEmail;
+      BUMPKIN_GIT_USER = cfg.git.userName;
     } // lib.optionalAttrs (cfg.git.sshKeyFile != null) {
       GIT_SSH_COMMAND = "ssh -i ${cfg.git.sshKeyFile} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new";
     };
@@ -77,6 +88,12 @@ let
             CFG_FORGE="${ps.forge}"''}
             ${lib.optionalString (ps.forgeApiUrl != null) ''
             CFG_FORGE_API="${ps.forgeApiUrl}"''}
+
+            mkdir -p "$(dirname "$CHECKOUT_PATH")"
+            # Serialize access to the checkout: services for different
+            # maintainers share packageSets and may fire concurrently.
+            (
+            flock -x 9
 
             # Resolve clone URL via nix flake metadata.
             META_FILE="/tmp/bumpkin-meta-${toString idx}.json"
@@ -110,24 +127,15 @@ let
               META_FILE=""
             fi
 
-            # Auth injection: SSH key takes priority over HTTPS token.
-            if [ -n "''${GIT_SSH_COMMAND:-}" ]; then
-              : # leave CLONE_URL as-is (SSH handles auth)
-            elif [ -n "''${GITHUB_TOKEN:-}" ]; then
-              case "$CLONE_URL" in
-                https://*)
-                  CLONE_URL="https://${cfg.git.userName or "bumpkin"}:''${GITHUB_TOKEN}@$(echo "$CLONE_URL" | sed 's|^https://||')"
-                  ;;
-              esac
-            fi
-
-            # Clone or fast-forward.
-            mkdir -p "$(dirname "$CHECKOUT_PATH")"
+            # HTTPS auth comes from the credential helper (reads GITHUB_TOKEN
+            # from the environment), so the token is never part of the remote
+            # URL. SSH auth is handled by GIT_SSH_COMMAND.
             if [ ! -d "$CHECKOUT_PATH/.git" ]; then
-              git clone "$CLONE_URL" "$CHECKOUT_PATH"
-            else
-              git -C "$CHECKOUT_PATH" fetch origin --prune
+              git clone -c credential.helper="${credentialHelper}" "$CLONE_URL" "$CHECKOUT_PATH"
             fi
+            git -C "$CHECKOUT_PATH" config credential.helper "${credentialHelper}"
+            git -C "$CHECKOUT_PATH" remote set-url origin "$CLONE_URL"
+            git -C "$CHECKOUT_PATH" fetch origin --prune
 
             # Branch selection: explicit > auto-discovered from upstream HEAD.
             if [ -n "''${CFG_BRANCH:-}" ]; then
@@ -137,15 +145,7 @@ let
               [ -z "$BRANCH" ] && BRANCH=$(git -C "$CHECKOUT_PATH" rev-parse --abbrev-ref HEAD)
             fi
 
-            git -C "$CHECKOUT_PATH" checkout "$BRANCH"
-            git -C "$CHECKOUT_PATH" merge --ff-only "origin/$BRANCH"
-
-            # Set remote with token for push if using HTTPS auth.
-            if [ -z "''${GIT_SSH_COMMAND:-}" ] && [ -n "''${GITHUB_TOKEN:-}" ]; then
-              git -C "$CHECKOUT_PATH" remote set-url origin "$CLONE_URL"
-            fi
-
-            # Clean up any mess from a previous run.
+            # Clean up any mess from a previous run and fast-forward.
             git -C "$CHECKOUT_PATH" checkout -f "$BRANCH"
             git -C "$CHECKOUT_PATH" reset --hard "origin/$BRANCH"
             git -C "$CHECKOUT_PATH" clean -fdx
@@ -177,7 +177,10 @@ let
               ${if cfg.actions.signed then "--signed" else ""} \
               ${if cfg.actions.push   then "--push"   else ""} \
               ${if cfg.actions.pr     then "--pr"     else ""} \
+              ${if ps.noBuild != [] then "--no-build ${lib.concatStringsSep "," ps.noBuild}" else ""} \
               ${if cfg.skip != [] then "--skip ${lib.concatStringsSep "," cfg.skip}" else ""}
+
+            ) 9>"$CHECKOUT_PATH.lock"
           '';
       in ''
         set -euo pipefail
@@ -378,6 +381,19 @@ in
                 - Forgejo: `https://forgejo.example.com/api/v1`
 
                 Only used when `forge` is explicitly `api`. Ignored otherwise.
+              '';
+            };
+
+            noBuild = mkOption {
+              type = types.listOf types.str;
+              default = [];
+              example = [ "waterfox" "waterfox-unwrapped" ];
+              description = ''
+                Package attribute names to skip building.
+                Versions and hashes are still updated, committed, and
+                included in PRs, but nix build is not run for these
+                packages. Useful for packages that take too long to
+                build locally.
               '';
             };
           };

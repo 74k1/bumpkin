@@ -7,6 +7,7 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
     in
     {
       nixosModules = {
@@ -22,7 +23,7 @@
         in {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "bumpkin";
-            version = "0.1.0";
+            version = cargoToml.package.version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
           };
@@ -34,6 +35,34 @@
           program = "${self.packages.${system}.default}/bin/bumpkin";
         };
       });
+
+      checks = forAllSystems (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in {
+          package = self.packages.${system}.default;
+        } // nixpkgs.lib.optionalAttrs (nixpkgs.lib.hasSuffix "-linux" system) {
+          # Evaluate the NixOS module with a minimal config and force the
+          # generated service script. git.userName is deliberately unset:
+          # the module must eval without it (regression test for a null
+          # string-interpolation bug).
+          nixos-module = let
+            nixos = nixpkgs.lib.nixosSystem {
+              inherit system;
+              modules = [
+                self.nixosModules.default
+                {
+                  services.bumpkin = {
+                    enable = true;
+                    maintainers = [ "74k1" ];
+                    packageSets = [ "github:74k1/tixpkgs" ];
+                  };
+                }
+              ];
+            };
+          in pkgs.runCommand "bumpkin-nixos-module-eval" {
+            script = nixos.config.systemd.services."bumpkin-74k1".script;
+          } "touch $out";
+        });
 
       devShells = forAllSystems (system:
         let pkgs = import nixpkgs { inherit system; };

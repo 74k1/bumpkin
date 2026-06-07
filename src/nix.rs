@@ -41,10 +41,7 @@ pub fn build_package(root: &Path, package: &str) -> Result<bool, String> {
 }
 
 /// Build and capture full output (for diagnostics in PR bodies).
-pub fn build_package_with_log(
-    root: &Path,
-    package: &str,
-) -> Result<(bool, String), String> {
+pub fn build_package_with_log(root: &Path, package: &str) -> Result<(bool, String), String> {
     let out = nix_cmd()
         .args([
             "build",
@@ -75,8 +72,8 @@ pub fn flake_input_info(root: &Path) -> Result<(String, String), String> {
     if !out.status.success() {
         return Ok((String::new(), String::new()));
     }
-    let stdout = String::from_utf8(out.stdout)
-        .map_err(|e| format!("decode flake input info: {e}"))?;
+    let stdout =
+        String::from_utf8(out.stdout).map_err(|e| format!("decode flake input info: {e}"))?;
     let mut input = String::new();
     let mut rev = String::new();
     for line in stdout.lines() {
@@ -87,6 +84,75 @@ pub fn flake_input_info(root: &Path) -> Result<(String, String), String> {
         }
     }
     Ok((input, rev))
+}
+
+/// Evaluated source info for a package, straight from Nix instead of
+/// scraping the .nix file: where the source actually lives.
+#[derive(Debug, Default)]
+pub struct SrcInfo {
+    /// `src.gitRepoUrl` (set by fetchFromGitHub and friends), if any.
+    pub git_repo_url: String,
+    /// `src.urls` (or `[src.url]`) of the source derivation.
+    pub urls: Vec<String>,
+}
+
+pub fn src_info(root: &Path, package: &str) -> Result<SrcInfo, String> {
+    if !root.join("flake.nix").exists() {
+        return Err("expected a flake root containing flake.nix".to_string());
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("canonicalize {}: {e}", root.display()))?;
+    let expr = src_info_expr(&format!("path:{}", root.display()), package);
+    let out = nix_cmd()
+        .args(["eval", "--raw", "--impure", "--expr", &expr])
+        .current_dir(&root)
+        .output()
+        .map_err(|e| format!("eval src info: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "eval src info failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let stdout = String::from_utf8(out.stdout).map_err(|e| format!("decode src info: {e}"))?;
+    let mut info = SrcInfo::default();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("gitRepoUrl\t") {
+            info.git_repo_url = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("url\t")
+            && !rest.is_empty()
+        {
+            info.urls.push(rest.to_string());
+        }
+    }
+    Ok(info)
+}
+
+fn src_info_expr(flake_ref: &str, package: &str) -> String {
+    format!(
+        r#"
+let
+  flake = builtins.getFlake "{flake_ref}";
+  system = builtins.currentSystem;
+  flakePackages = flake.packages.${{system}} or {{}};
+  legacyPackages = flake.legacyPackages.${{system}} or {{}};
+  package = flakePackages."{package}" or legacyPackages."{package}" or (throw "package `{package}` not found");
+  src = package.src or null;
+  str = value: let r = builtins.tryEval (builtins.toString value); in if r.success then r.value else "";
+  gitRepoUrl = if src == null then "" else str (src.gitRepoUrl or "");
+  urls =
+    let r = builtins.tryEval (
+      if src == null then []
+      else if src ? urls then map builtins.toString src.urls
+      else if src ? url then [ (builtins.toString src.url) ]
+      else []);
+    in if r.success then r.value else [];
+in builtins.concatStringsSep "\n" ([ ("gitRepoUrl\t" + gitRepoUrl) ] ++ map (u: "url\t" + u) urls)
+"#,
+        flake_ref = escape_nix_string(flake_ref),
+        package = escape_nix_string(package)
+    )
 }
 
 pub fn build_update_script(root: &Path, package: &str) -> Result<String, String> {

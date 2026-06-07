@@ -4,10 +4,7 @@
 //! - `GitHubCli`: wraps the `gh` binary
 //! - `CompatibleApi`: direct curl calls to the REST API (zero deps, works with Gitea/Forgejo)
 
-use std::{
-    path::Path,
-    process::Command,
-};
+use std::{path::Path, process::Command};
 
 /// Resolve which forge backend to use from options.
 pub fn resolve(
@@ -27,12 +24,10 @@ pub fn resolve(
         }
 
         "api" => {
-            let token = token
-                .ok_or("forge `api` requires a token (set GITHUB_TOKEN or ghTokenFile)")?;
-            let base = api_url
-                .ok_or("forge `api` requires --forge-api-url")?;
-            CompatibleApi::new(token, repo_url, Some(base))
-                .map(ForgeBackend::CompatibleApi)
+            let token =
+                token.ok_or("forge `api` requires a token (set GITHUB_TOKEN or ghTokenFile)")?;
+            let base = api_url.ok_or("forge `api` requires --forge-api-url")?;
+            CompatibleApi::new(token, repo_url, Some(base)).map(ForgeBackend::CompatibleApi)
         }
 
         "auto" => {
@@ -46,7 +41,9 @@ pub fn resolve(
                 .map(ForgeBackend::CompatibleApi)
         }
 
-        other => Err(format!("unknown forge: {other} (expected auto, github-cli, github-api, or api)")),
+        other => Err(format!(
+            "unknown forge: {other} (expected auto, github-cli, github-api, or api)"
+        )),
     }
 }
 
@@ -96,8 +93,16 @@ impl GitHubCli {
     fn find_existing_pr(&self, root: &Path, head: &str) -> Result<Option<u32>, String> {
         let out = Command::new("gh")
             .args([
-                "pr", "list", "--head", head, "--state", "open",
-                "--json", "number", "--jq", ".[0].number",
+                "pr",
+                "list",
+                "--head",
+                head,
+                "--state",
+                "open",
+                "--json",
+                "number",
+                "--jq",
+                ".[0].number",
             ])
             .current_dir(root)
             .output()
@@ -131,11 +136,7 @@ impl GitHubCli {
     ) -> Result<String, String> {
         let out = Command::new("gh")
             .args([
-                "pr", "create",
-                "--head", head,
-                "--base", base,
-                "--title", title,
-                "--body", body,
+                "pr", "create", "--head", head, "--base", base, "--title", title, "--body", body,
             ])
             .current_dir(root)
             .output()
@@ -189,33 +190,27 @@ impl CompatibleApi {
         head: &str,
         base: &str,
         owner: &str,
-        _repo: &str,
+        repo: &str,
     ) -> Result<Option<u32>, String> {
-        // GET /repos/{owner}/{repo}/pulls?head={owner}:{head}&state=open&base={base}
+        // GitHub supports filtering by head=owner:branch; Gitea/Forgejo ignore
+        // unknown query params, so the head match below is done client-side.
         let url = format!(
-            "{}/repos/{owner}/{_repo}/pulls?head={owner}:{head}&state=open&base={base}",
-            self.api_base, owner = owner, _repo = _repo, head = head, base = base
+            "{}/repos/{owner}/{repo}/pulls?state=open&base={base}&head={owner}:{head}&per_page=100&limit=100",
+            self.api_base
         );
 
         let out = curl_get(&url, &self.token)?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let body = String::from_utf8_lossy(&out.stdout);
+        let trimmed = body.trim();
+        if !trimmed.starts_with('[') {
+            return Err(format!("unexpected pulls response:\n{trimmed}"));
+        }
 
-        // The response is a JSON array. Extract the first PR number.
-        let number = stdout
-            .lines()
-            .find(|line| line.trim().starts_with("\"number\":"))
-            .or_else(|| stdout.lines().find(|line| line.contains("\"number\"")))
-            .and_then(|line| {
-                line.split(':')
-                    .nth(1)
-                    .map(|v| v.trim().trim_end_matches(',').parse::<u32>().ok())
-                    .flatten()
-            });
-
-        if let Some(number) = number {
-            // Only consider it found if we got a valid JSON array response
-            if stdout.trim().starts_with('[') {
-                return Ok(Some(number));
+        for object in top_level_objects(trimmed) {
+            let head_ref = extract_object(object, "head")
+                .and_then(|head_obj| extract_string_at_depth1(head_obj, "ref"));
+            if head_ref.as_deref() == Some(head) {
+                return Ok(extract_u32_at_depth1(object, "number"));
             }
         }
         Ok(None)
@@ -237,43 +232,180 @@ impl CompatibleApi {
 
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(format!("create PR failed ({}):\n{stdout}\n{stderr}", out.status));
+            return Err(format!(
+                "create PR failed ({}):\n{stdout}\n{stderr}",
+                out.status
+            ));
         }
 
         // Extract the html_url from the JSON response.
-        extract_field(&stdout, "html_url").ok_or_else(|| {
-            format!("could not parse PR URL from response:\n{stdout}")
-        })
+        extract_field(&stdout, "html_url")
+            .ok_or_else(|| format!("could not parse PR URL from response:\n{stdout}"))
     }
 }
 
 // --- Helpers ---
 
 fn curl_get(url: &str, token: &str) -> Result<std::process::Output, String> {
-    Command::new("curl")
-        .args([
-            "-sS",
-            "-H", &format!("Authorization: Bearer {token}"),
-            "-H", "Accept: application/vnd.github+json",
-            url,
-        ])
-        .output()
-        .map_err(|e| format!("curl {url}: {e}"))
+    curl_with_token(&[], url, token)
 }
 
 fn curl_post(url: &str, token: &str, body: &str) -> Result<std::process::Output, String> {
-    Command::new("curl")
+    curl_with_token(
+        &[
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            body,
+        ],
+        url,
+        token,
+    )
+}
+
+/// Run curl with the Authorization header passed via a stdin config file
+/// instead of argv, so the token is not visible in /proc/<pid>/cmdline.
+fn curl_with_token(
+    extra_args: &[&str],
+    url: &str,
+    token: &str,
+) -> Result<std::process::Output, String> {
+    let mut child = Command::new("curl")
         .args([
             "-sS",
-            "-X", "POST",
-            "-H", &format!("Authorization: Bearer {token}"),
-            "-H", "Accept: application/vnd.github+json",
-            "-H", "Content-Type: application/json",
-            "-d", body,
-            url,
+            "--config",
+            "-",
+            "-H",
+            "Accept: application/vnd.github+json",
         ])
-        .output()
+        .args(extra_args)
+        .arg(url)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("curl {url}: {e}"))?;
+    {
+        use std::io::Write;
+        let escaped = token.replace('\\', "\\\\").replace('"', "\\\"");
+        child
+            .stdin
+            .as_mut()
+            .ok_or("curl stdin unavailable")?
+            .write_all(format!("header = \"Authorization: Bearer {escaped}\"\n").as_bytes())
+            .map_err(|e| format!("write curl config: {e}"))?;
+    }
+    child
+        .wait_with_output()
         .map_err(|e| format!("curl {url}: {e}"))
+}
+
+/// Split a top-level JSON array into its object slices, tracking strings and
+/// escapes so braces inside PR titles/bodies don't confuse the count.
+fn top_level_objects(json: &str) -> Vec<&str> {
+    let mut objects = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escaping = false;
+    for (i, ch) in json.char_indices() {
+        if escaping {
+            escaping = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaping = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => {
+                if depth == 0 {
+                    start = i;
+                }
+                depth += 1;
+            }
+            '}' if !in_string => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    objects.push(&json[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    objects
+}
+
+/// Visit each position of an object that sits at nesting depth 1 (i.e. a key
+/// of the object itself, not of a nested object) and return the first one
+/// where the callback produces a value.
+fn find_at_depth1<T>(object: &str, mut visit: impl FnMut(usize) -> Option<T>) -> Option<T> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaping = false;
+    for (i, ch) in object.char_indices() {
+        if escaping {
+            escaping = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaping = true,
+            '"' => {
+                if !in_string
+                    && depth == 1
+                    && let Some(found) = visit(i)
+                {
+                    return Some(found);
+                }
+                in_string = !in_string;
+            }
+            '{' | '[' if !in_string => depth += 1,
+            '}' | ']' if !in_string => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Position of the value after `"field":` (plus whitespace) for a direct key
+/// of `object`. A depth-1 string *value* that merely equals the field name
+/// (no colon after it) is skipped.
+fn value_pos_at_depth1(object: &str, field: &str) -> Option<usize> {
+    let needle = format!("\"{field}\"");
+    find_at_depth1(object, |i| {
+        let rest = object[i..].strip_prefix(&needle)?;
+        let colon = rest.find(|c: char| !c.is_whitespace())?;
+        let rest = rest[colon..].strip_prefix(':')?;
+        let value = rest.find(|c: char| !c.is_whitespace())?;
+        Some(i + needle.len() + colon + 1 + value)
+    })
+}
+
+/// Slice out the `"field": {...}` object that is a direct key of `object`.
+fn extract_object<'a>(object: &'a str, field: &str) -> Option<&'a str> {
+    let pos = value_pos_at_depth1(object, field)?;
+    let inner = &object[pos..];
+    if !inner.starts_with('{') {
+        return None;
+    }
+    top_level_objects(inner).into_iter().next()
+}
+
+/// Extract a string value for a direct key of `object`.
+fn extract_string_at_depth1(object: &str, field: &str) -> Option<String> {
+    let pos = value_pos_at_depth1(object, field)?;
+    let rest = object[pos..].strip_prefix('"')?;
+    unescape_until_quote(rest)
+}
+
+/// Extract an unsigned integer value for a direct key of `object`.
+fn extract_u32_at_depth1(object: &str, field: &str) -> Option<u32> {
+    let pos = value_pos_at_depth1(object, field)?;
+    let digits: String = object[pos..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 /// Hand-rolled minimal JSON for the PR body to avoid pulling in serde.
@@ -294,14 +426,29 @@ fn serde_json_pr_body(head: &str, base: &str, title: &str, body: &str) -> String
     )
 }
 
-/// Extract a string field value from a JSON response.
+/// Extract a string field value from a JSON response. Tolerates whitespace
+/// after the colon (GitHub pretty-prints its responses).
 fn extract_field(json: &str, field: &str) -> Option<String> {
-    let needle = format!("\"{field}\":\"");
-    let start = json.find(&needle)? + needle.len();
-    let mut chars = json[start..].chars();
+    let needle = format!("\"{field}\"");
+    let mut from = 0;
+    while let Some(pos) = json[from..].find(&needle) {
+        let after = from + pos + needle.len();
+        let rest = json[after..].trim_start();
+        if let Some(rest) = rest.strip_prefix(':')
+            && let Some(rest) = rest.trim_start().strip_prefix('"')
+        {
+            return unescape_until_quote(rest);
+        }
+        from = after;
+    }
+    None
+}
+
+/// Unescape a JSON string up to (excluding) its closing quote.
+fn unescape_until_quote(text: &str) -> Option<String> {
     let mut out = String::new();
     let mut escaping = false;
-    for ch in &mut chars {
+    for ch in text.chars() {
         if escaping {
             match ch {
                 'n' => out.push('\n'),
@@ -374,8 +521,7 @@ mod tests {
 
     #[test]
     fn parse_repo_url_ssh() {
-        let (host, owner, repo) =
-            parse_repo_url("git@github.com:74k1/tixpkgs.git").unwrap();
+        let (host, owner, repo) = parse_repo_url("git@github.com:74k1/tixpkgs.git").unwrap();
         assert_eq!(host, "github.com");
         assert_eq!(owner, "74k1");
         assert_eq!(repo, "tixpkgs");
@@ -383,8 +529,7 @@ mod tests {
 
     #[test]
     fn parse_repo_url_https() {
-        let (host, owner, repo) =
-            parse_repo_url("https://github.com/NixOS/nixpkgs.git").unwrap();
+        let (host, owner, repo) = parse_repo_url("https://github.com/NixOS/nixpkgs.git").unwrap();
         assert_eq!(host, "github.com");
         assert_eq!(owner, "NixOS");
         assert_eq!(repo, "nixpkgs");
@@ -401,8 +546,7 @@ mod tests {
 
     #[test]
     fn parse_repo_url_no_dotgit() {
-        let (host, owner, repo) =
-            parse_repo_url("https://github.com/a/b").unwrap();
+        let (host, owner, repo) = parse_repo_url("https://github.com/a/b").unwrap();
         assert_eq!(host, "github.com");
         assert_eq!(owner, "a");
         assert_eq!(repo, "b");
@@ -445,5 +589,63 @@ mod tests {
             extract_field(json, "message"),
             Some("line1\nline2\\path".to_string())
         );
+    }
+
+    #[test]
+    fn extract_field_handles_pretty_printed_json() {
+        let json = "{\n  \"html_url\": \"https://github.com/o/r/pull/1\"\n}";
+        assert_eq!(
+            extract_field(json, "html_url"),
+            Some("https://github.com/o/r/pull/1".to_string())
+        );
+    }
+
+    // Compact single-line JSON, as returned by Gitea/Forgejo. The title
+    // contains braces and a quoted "number" to stress the scanner.
+    const GITEA_PULLS: &str = r#"[{"id":901,"number":17,"title":"chore: weird {braces} and \"number\": 99","head":{"label":"bumpkin/foo","ref":"bumpkin/foo","repo":{"id":3,"full_name":"o/r"}},"base":{"ref":"main"}},{"id":902,"number":18,"title":"feat(bar): 1 -> 2","head":{"ref":"bumpkin/bar","repo":{"id":3}},"base":{"ref":"main"}}]"#;
+
+    #[test]
+    fn top_level_objects_split_compact_array() {
+        let objects = top_level_objects(GITEA_PULLS.trim());
+        assert_eq!(objects.len(), 2);
+    }
+
+    #[test]
+    fn pr_dedup_matches_head_ref_client_side() {
+        let objects = top_level_objects(GITEA_PULLS.trim());
+        let found = objects.iter().find_map(|object| {
+            let head_ref = extract_object(object, "head")
+                .and_then(|head| extract_string_at_depth1(head, "ref"));
+            (head_ref.as_deref() == Some("bumpkin/bar"))
+                .then(|| extract_u32_at_depth1(object, "number"))
+                .flatten()
+        });
+        assert_eq!(found, Some(18));
+    }
+
+    #[test]
+    fn pr_dedup_ignores_number_in_strings_and_nested_objects() {
+        let objects = top_level_objects(GITEA_PULLS.trim());
+        // The first object's number is 17, not the 901 id, the 99 in the
+        // title, or the nested repo id.
+        assert_eq!(extract_u32_at_depth1(objects[0], "number"), Some(17));
+        let head = extract_object(objects[0], "head").unwrap();
+        assert_eq!(
+            extract_string_at_depth1(head, "ref").as_deref(),
+            Some("bumpkin/foo")
+        );
+    }
+
+    #[test]
+    fn pr_dedup_handles_pretty_printed_github_response() {
+        let json = "[\n  {\n    \"number\": 5,\n    \"head\": {\n      \"ref\": \"bumpkin/foo\"\n    }\n  }\n]";
+        let objects = top_level_objects(json.trim());
+        assert_eq!(objects.len(), 1);
+        let head = extract_object(objects[0], "head").unwrap();
+        assert_eq!(
+            extract_string_at_depth1(head, "ref").as_deref(),
+            Some("bumpkin/foo")
+        );
+        assert_eq!(extract_u32_at_depth1(objects[0], "number"), Some(5));
     }
 }

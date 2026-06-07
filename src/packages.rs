@@ -37,37 +37,50 @@ impl Backend {
         matches!(self, Self::UpdateScript)
     }
 
+    /// Native update = discover tags via `git ls-remote` on the evaluated src
+    /// URL, then let Nix compute src/dependency hashes. That works for any
+    /// git-hosted source, so most fetchers qualify; registry-based sources
+    /// (PyPI, crates.io, ...) and exotic VCSes still need an updateScript.
     pub fn is_native_candidate(&self) -> bool {
-        matches!(
-            self,
-            Self::FetchFromGitHub
-                | Self::GitHubReleaseAsset
-                | Self::Ecosystem("buildGoModule")
-                | Self::Ecosystem("rust/cargo")
-                | Self::Ecosystem("npm")
-        )
+        match self {
+            Self::FetchFromGitHub | Self::GitHubReleaseAsset => true,
+            Self::NativeFetcher(name) => matches!(
+                *name,
+                "fetchurl"
+                    | "fetchzip"
+                    | "fetchgit"
+                    | "builtins.fetchGit"
+                    | "fetchFromGitLab"
+                    | "fetchFromGitea"
+                    | "fetchFromForgejo"
+                    | "fetchFromSourcehut"
+                    | "fetchFromBitbucket"
+                    | "fetchFromCodeberg"
+                    | "fetchFromGitiles"
+                    | "fetchFromRepoOrCz"
+                    | "fetchFromSavannah"
+            ),
+            Self::Ecosystem(name) => matches!(
+                *name,
+                "buildGoModule" | "rust/cargo" | "npm" | "pnpm" | "yarn" | "maven" | "mix"
+            ),
+            _ => false,
+        }
     }
 
     pub fn note(&self) -> &'static str {
         match self {
             Self::UpdateScript => "run update script",
-            Self::FetchFromGitHub => {
-                "native updater: GitHub tags -> version/src hash, plus known dependency hashes"
+            Self::FetchFromGitHub | Self::GitHubReleaseAsset => {
+                "native updater: git tags -> version; Nix computes src/dependency hashes"
             }
-            Self::GitHubReleaseAsset => {
-                "native updater: GitHub release tags/assets -> version/src hash, plus known dependency hashes"
+            Self::NativeFetcher(_) | Self::Ecosystem(_) => {
+                if self.is_native_candidate() {
+                    "native updater: git tags -> version; Nix computes src/dependency hashes"
+                } else {
+                    "skip: not git-hosted; add an updateScript"
+                }
             }
-            Self::Ecosystem("buildGoModule") => {
-                "native updater: GitHub source plus vendorHash when source is supported"
-            }
-            Self::Ecosystem("rust/cargo") => {
-                "native updater: GitHub source plus cargoHash/vendor hash when source is supported"
-            }
-            Self::Ecosystem("npm") => {
-                "native updater: GitHub source plus npmDepsHash when source is supported"
-            }
-            Self::NativeFetcher(_) => "recognized fetcher; add updateScript or implement a safe native updater for this fetcher",
-            Self::Ecosystem(_) => "recognized ecosystem fetcher/dependency helper; add updateScript or implement a safe native updater",
             Self::Unknown => "skip: needs updateScript or supported native fetcher",
         }
     }
@@ -479,9 +492,6 @@ mod tests {
 
     #[test]
     fn has_maintainer_returns_false_for_empty_list() {
-        assert!(!has_maintainer(
-            "maintainers = [ ];",
-            "74k1"
-        ));
+        assert!(!has_maintainer("maintainers = [ ];", "74k1"));
     }
 }

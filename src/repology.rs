@@ -34,9 +34,15 @@ pub fn latest_version(pname: &str) -> Option<String> {
         let status_pos = body[pos..].find("\"status\":\"newest\"");
         let Some(sp) = status_pos else { break };
         let entry_start = body[..pos + sp].rfind('{');
-        let Some(es) = entry_start else { pos += sp + 1; continue; };
+        let Some(es) = entry_start else {
+            pos += sp + 1;
+            continue;
+        };
         let entry_end = body[pos + sp..].find("},");
-        let Some(ee) = entry_end else { pos += sp + 1; continue; };
+        let Some(ee) = entry_end else {
+            pos += sp + 1;
+            continue;
+        };
         let entry = &body[es..pos + sp + ee + 1];
 
         // Extract version from this entry
@@ -47,7 +53,9 @@ pub fn latest_version(pname: &str) -> Option<String> {
                 let parts = parse_version_parts(version);
                 match &best {
                     Some((best_p, _)) if parts <= *best_p => {}
-                    _ => { best = Some((parts, version.to_string())); }
+                    _ => {
+                        best = Some((parts, version.to_string()));
+                    }
                 }
             }
         }
@@ -76,10 +84,7 @@ mod tests {
         assert_eq!(parse_version_parts("1.2.3"), vec![1, 2, 3]);
         assert_eq!(parse_version_parts("3.1.2.4938"), vec![3, 1, 2, 4938]);
         assert_eq!(parse_version_parts("v1.0.0"), vec![1, 0, 0]);
-        assert_eq!(
-            parse_version_parts("unstable-2024-01-01"),
-            vec![2024, 1, 1]
-        );
+        assert_eq!(parse_version_parts("unstable-2024-01-01"), vec![2024, 1, 1]);
         assert!(parse_version_parts("hello").is_empty());
     }
 }

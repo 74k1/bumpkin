@@ -1,8 +1,11 @@
 [package]
 name = "bumpkin"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 license = "MIT"
 description = "Small Rust updater/PR steward for Nix flake package sets"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

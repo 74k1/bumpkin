@@ -1,6 +1,21 @@
-# bumpkin
+<img align="left" src="/.github/assets/bumpkin.png" width="256px" />
 
-Rust upkeep bot for Nix flake package sets. Finds packages by maintainer, runs update scripts (or native fetcher updaters), builds, commits, pushes, opens PRs.
+<br/>
+<br/>
+
+<div align="right">
+    <h3><a href="http://bumpkin.urbanup.com/586439">Bumpkin</a> 🌽</h3>
+    Bump your nix flake package sets.
+</div>
+
+<br/>
+<br/>
+<br/>
+<br/>
+
+## About
+
+Finds packages by maintainer, runs update scripts (or native fetcher updaters), builds, commits, pushes, opens PRs.
 
 ## Build
 
@@ -23,14 +38,25 @@ bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs
 # Update one package (local, no commit)
 bumpkin update --package arcbrush --root $HOME/dev/tixpkgs
 
+# Update one package: dedicated branch, commit, push, PR
+bumpkin update --package arcbrush --root $HOME/dev/tixpkgs --commit --signed --push --pr
+
 # Batch maintainer: per-package branches, commit, push, PR
 bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --signed --push --pr
 
-# Per-machine blocklist
+# Per-machine blocklist (works for dry-run and update)
 BUMPKIN_SKIP=waterfox,waterfox-unwrapped bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs
+bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build waterfox,waterfox-unwrapped
 ```
 
-**Update priority:** package-owned `updateScript` → native fetcher (GitHub/GitLab/sourcehut/fetchgit) → Repology (version hint only).
+**Update priority:** package-owned `updateScript` → native updater → Repology (version hint only).
+
+**Native updater:** evaluates the package's `src` with Nix to find the upstream
+git URL, discovers new versions via `git ls-remote --tags` (works on any git
+host: GitHub, GitLab, sourcehut, Codeberg, Gitea, ...), then writes fake
+src/dependency hashes and lets `nix build` report the real ones. Since Nix runs
+the fetcher itself, every fetcher is supported as long as the source is
+git-hosted and version-linked (`rev`/`tag`/`url` referencing `${version}`).
 
 **Forge backends:** `auto` (gh CLI if available, else GitHub REST API), `github-cli`, `github-api`, `api` (Gitea/Forgejo REST API).
 
@@ -57,6 +83,7 @@ Use `default` unless you need a custom bumpkin derivation:
 
     packageSets = [
       "github:74k1/tixpkgs"
+      { repo = "github:74k1/tixpkgs"; noBuild = [ "waterfox" "waterfox-unwrapped" ]; }
       { repo = "https://git.example.com/org/pkgs.git"; forge = "api"; forgeApiUrl = "https://git.example.com/api/v1"; }
     ];
 
@@ -95,10 +122,12 @@ Use `default` unless you need a custom bumpkin derivation:
 | `packageSets.*.path` | null or str | `null` | Checkout path (default: `/var/lib/bumpkin/<owner>/<repo>`) |
 | `packageSets.*.forge` | null or str | `null` | Forge backend override (null = auto-detect) |
 | `packageSets.*.forgeApiUrl` | null or str | `null` | API URL for `api` forge |
+| `packageSets.*.noBuild` | list of str | `[]` | Package attr names to skip building (still update/commit/PR) |
 | `actions.commit` | bool | `false` | Create per-package commits |
 | `actions.signed` | bool | `false` | GPG/SSH sign commits |
 | `actions.push` | bool | `false` | Push branches to origin |
 | `actions.pr` | bool | `false` | Open pull requests |
+| `skip` | list of str | `[]` | Package attr names to skip entirely |
 | `forgeTokenFile` | null or str | `null` | Path to forge PAT file (GitHub, Gitea, Forgejo) |
 | `gpgKeyFile` | null or str | `null` | Path to ASCII-armored GPG key |
 | `git.userName` | null or str | `null` | Git author name |
@@ -115,8 +144,10 @@ Use `default` unless you need a custom bumpkin derivation:
 ### Auth
 
 - `forgeTokenFile` — forge personal access token. Used for forge API calls (PR
-  creation) and optionally for HTTPS git transport when `git.sshKeyFile` is not
-  set. Works with GitHub, Gitea, and Forgejo.
+  creation) and for HTTPS git transport when `git.sshKeyFile` is not set.
+  Works with GitHub, Gitea, and Forgejo. The token is supplied through a git
+  credential helper and a curl stdin config, so it never appears in remote
+  URLs, `.git/config`, or process command lines.
 - `git.sshKeyFile` — SSH private key for git transport (clone, fetch, push).
   Takes priority over `forgeTokenFile` for git auth. The `forgeTokenFile` is
   still used for forge API calls.

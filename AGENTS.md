@@ -30,28 +30,46 @@ Bumpkin is a Rust/Nix flake upkeep bot. It should work for arbitrary flake packa
 ## Update priority order
 
 1. package-owned `updateScript` / `passthru.updateScript`
-2. Native fetcher: `fetchFromGitHub` → GitHub releases (tags + release assets)
-3. Native fetcher: GitLab API, sourcehut git, `fetchgit` ls-remote
-4. Repology API (last resort — version hint only, never overrides forge APIs)
+2. Native updater, driven by Nix rather than per-forge clients:
+   - `nix eval` the package `src` for `gitRepoUrl`/`urls` (no .nix text scraping
+     for the source location)
+   - new versions via `git ls-remote --tags` on the derived git URL (works on
+     any git host: GitHub, GitLab, sourcehut, Codeberg, Gitea, Bitbucket, ...)
+   - hashes via the fake-hash trick: write `sha256-AAAA...=` for src and known
+     dependency hashes, run `nix build`, read the `got:` hashes from the
+     mismatch errors, loop until none remain. Nix runs the fetcher, so every
+     fetcher is supported without bot-side prefetch code.
+   - requires a version-linked source: a `rev`/`tag`/`url` assignment
+     referencing `${version}`; pinned-rev packages are skipped.
+3. Repology API (last resort — version hint only, never drives updates)
 
 ## Project layout
 
 ```
 src/
-  main.rs        # CLI argument parsing, config loading, command dispatch
-  lib.rs         # Options struct, config module, JSON output helpers
+  main.rs        # Tracing init, CLI parse entrypoint, error exit
+  lib.rs         # Clap CLI structs (Commands, flags), config loading, command dispatch
   update.rs      # Update logic: dry-run, per-package update, batch maintainer update,
-                 #   native fetchers (fetchFromGitHub, GitHub releases, GitLab, sourcehut, fetchgit),
-                 #   dependency hash refresh (cargoHash, vendorHash, npmDepsHash, yarnHash, etc.)
+                 #   native updater (git ls-remote tags + Nix-computed hashes),
+                 #   fake-hash refresh loop (src + cargoHash, vendorHash, npmDepsHash, etc.)
   packages.rs    # Package discovery, maintainer filtering, fetcher classification
   nix.rs         # Nix evaluation: package version, build, updateScript, maintainer query,
-                 #   flake input info (nixpkgs rev for PR bodies)
+                 #   src info (gitRepoUrl/urls), flake input info (nixpkgs rev for PR bodies)
   git.rs         # Git helpers: branch, commit, push, diff, remote_url
   forge.rs       # Forge abstraction: PR create/find via gh CLI, GitHub REST API, Gitea/Forgejo REST API
   repology.rs    # Repology.org version oracle (free, no API key)
 modules/nixos/
   bumpkin.nix    # NixOS module: systemd timers + oneshot services
 ```
+
+## Dependencies
+
+- **clap** (derive): CLI argument parsing, subcommand dispatch, auto-generated `--help`.
+- **tracing** / **tracing-subscriber** (env-filter): structured logging.
+  - Default level: `info` (per-package results, summary).
+  - `--verbose` / `-v` enables `debug` (internal steps, diffs, "trying..." messages).
+  - `RUST_LOG` env var overrides both (e.g., `RUST_LOG=warn` for quiet runs).
+  - `println!` is retained for data output (JSON, tab-separated list); logs go to stderr.
 
 ## NixOS module
 
@@ -62,7 +80,7 @@ then runs `bumpkin update --root <path> --maintainer <name>`.
 Options exposed to NixOS:
 - `services.bumpkin.enable`
 - `services.bumpkin.maintainers` — list of maintainer handles
-- `services.bumpkin.packageSets` — list of flake refs (string sugar) or attrsets with `repo`, `branch`, `path`, `forge`, `forgeApiUrl`
+- `services.bumpkin.packageSets` — list of flake refs (string sugar) or attrsets with `repo`, `branch`, `path`, `forge`, `forgeApiUrl`, `noBuild`
 - `services.bumpkin.actions.commit` / `.signed` / `.push` / `.pr` — batch commit/push/PR behaviour
 - `services.bumpkin.forgeTokenFile` — path to forge PAT file (GitHub, Gitea, Forgejo)
 - `services.bumpkin.gpgKeyFile` — path to ASCII-armored GPG key for sign+import
@@ -79,6 +97,7 @@ nix develop -c cargo test --lib
 nix develop -c cargo build --release
 ./target/release/bumpkin list --maintainer 74k1 --root $HOME/dev/tixpkgs
 ./target/release/bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs
+./target/release/bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs --verbose  # debug details
 ./target/release/bumpkin run-update-script --package arcbrush --root $HOME/dev/tixpkgs
 ./target/release/bumpkin update --package arcbrush --root $HOME/dev/tixpkgs
 ./target/release/bumpkin update --package arcbrush --root $HOME/dev/tixpkgs --commit --signed
@@ -91,6 +110,7 @@ nix develop -c cargo build --release
 
 # Per-machine build blocklist (env var, comma-separated)
 BUMPKIN_SKIP=waterfox,waterfox-unwrapped ./target/release/bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs
+./target/release/bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build waterfox,waterfox-unwrapped
 
 # NixOS module test
 nix flake check
@@ -101,9 +121,15 @@ nix flake check
 - Maintainer scans default to evaluating `packages.$system.*.meta.maintainers`; source scanning is a fallback.
 - `run-update-script` supports flake package outputs, checks `passthru.updateScript` plus top-level `updateScript`.
 - `update --maintainer --commit` runs per-package branches sequentially; it does not parallelize across packages (Nix builds are single-instance anyway).
+- `update --package` supports `--commit --push --pr` too (per-package branch flow, same as batch mode); `--push` requires `--commit`, `--pr` requires `--push`.
+- Commit mode refuses to run from a detached HEAD (no branch to return to).
 - Repology is a fallback version hint only; it does not drive the primary update flow.
-- GitLab/sourcehut/fetchgit source detection works, but actual prefetch requires writing updateScripts — the native updater delegates to updateScript for non-GitHub sources.
+- Registry-based sources (`fetchPypi`, `fetchCrate`, ...) and non-git VCSes still need updateScripts; the native updater handles git-hosted sources only.
+- Non-numeric versions (rc/beta tags, `unstable-…` dates) are skipped by the native updater.
 - Multi-platform builds are not supported; bumpkin builds only on the local system.
 - No CVE checking or rebuild-impact estimation (unlike nixpkgs-update).
-- Forge PR dedup covers `gh` CLI, GitHub REST API, and Gitea/Forgejo REST API.
-- Dependency hash refresh covers: `cargoHash`, `vendorHash`, `npmDepsHash`, `yarnHash`, `pomHash`, `mvnHash`, `mixHash`, `nugetHash`, `dotnetHash`.
+- Forge PR dedup covers `gh` CLI, GitHub REST API, and Gitea/Forgejo REST API. Gitea/Forgejo do not support the `head=` filter, so matching is done client-side on `head.ref`.
+- Dependency hash refresh covers: `cargoHash`, `vendorHash`, `npmDepsHash`, `yarnHash`, `pomHash`, `mvnHash`, `mixHash`, `nugetHash`, `dotnetHash`; multiple hashes per package are resolved iteratively.
+- `noBuild` (`--no-build`) is per-packageSet in the NixOS module, comma-separated at the CLI. Skipped packages still get version/hash updates, commits, and PRs; only the `nix build` step is omitted.
+- `BUMPKIN_SKIP` (comma-separated env var) applies to both `dry-run` and `update`.
+- `nix flake check` builds the package (incl. cargo tests) and evaluates the NixOS module with a minimal config (`checks.<system>.nixos-module`).

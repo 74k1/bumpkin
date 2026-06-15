@@ -15,7 +15,15 @@
 
 ## About
 
+> [!NOTE]
+> I hope you can tell by the AGENTS.md file that this is a vibecoded project and is mainly intended to be used by myself for my own repositories. Should this not be a warning to you, feel free to try to run it as well.
+> 
+> I'm still learning rust and I needed something quick to do the updating of packages in my own repository (just [tixpkgs](https://github.com/74k1/tixpkgs)).
+> I can promise, that once I've learned rust on a level where I can take a big look at this codebase, I'll rewrite it by hand. (The logo for example, is already handmade. Thanks to a friend for the Idea.)
+
 Finds packages by maintainer, runs update scripts (or native fetcher updaters), builds, commits, pushes, opens PRs.
+
+[Here](https://github.com/74k1/tix/blob/main/modules/nixos/daemons/bumpkin/default.nix)'s an example of how I set it up with the NixOS Module.
 
 ## Build
 

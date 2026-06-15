@@ -56,7 +56,7 @@ pub fn dry_run_package(root: &Path, package: &str) -> Result<(), String> {
 fn ensure_on_branch(branch: &str) -> Result<(), String> {
     if branch.is_empty() {
         return Err(
-            "HEAD is detached (no current branch); commit mode needs a branch to return to — \
+            "HEAD is detached (no current branch); commit mode needs a branch to return to - \
              check out a branch first"
                 .to_string(),
         );
@@ -436,7 +436,7 @@ pub fn update_package(root: &Path, package: &str, commit: CommitOptions) -> Resu
     Ok(())
 }
 
-/// Run a package's updateScript directly (no CLI arg parsing needed — clap handles it).
+/// Run a package's updateScript directly (no CLI arg parsing needed - clap handles it).
 pub fn run_update_script_direct(root: &Path, package: &str) -> Result<(), String> {
     run_update_script(root, package)
 }
@@ -466,11 +466,11 @@ fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
 /// Native fetcher update, driven by Nix instead of per-forge implementations:
 ///
 /// 1. `nix eval` the package's `src` to find where the source actually lives
-///    (`gitRepoUrl` / `urls`) — no .nix text scraping for the source location.
+///    (`gitRepoUrl` / `urls`) - no .nix text scraping for the source location.
 /// 2. `git ls-remote --tags` against that URL works for any git host
 ///    (GitHub, GitLab, sourcehut, Codeberg, Gitea, ...).
 /// 3. Rewrite the version, set the src + dependency hashes to the fake hash,
-///    and let `nix build` report the real ones — Nix runs the fetcher itself,
+///    and let `nix build` report the real ones - Nix runs the fetcher itself,
 ///    so this supports every fetcher without bot-side prefetch logic.
 fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
     tracing::debug!("{package}: trying native fetcher...");
@@ -568,7 +568,7 @@ fn repology_hint(text: &str, old_version: &str, reason: &str) -> String {
         && repology_ver != old_version
     {
         return format!(
-            "{reason}; Repology knows {pname} = {repology_ver} (nix has {old_version}) — add an updateScript"
+            "{reason}; Repology knows {pname} = {repology_ver} (nix has {old_version}) - add an updateScript"
         );
     }
     format!("{reason}; add an updateScript")
@@ -626,7 +626,7 @@ fn git_url_from_archive_url(url: &str) -> Option<String> {
     if host == "git.sr.ht" {
         return Some(format!("https://git.sr.ht/{owner}/{repo}"));
     }
-    // A plain repo URL (e.g. from fetchgit) — but not a two-segment tarball URL.
+    // A plain repo URL (e.g. from fetchgit) - but not a two-segment tarball URL.
     if segments.len() == 2 {
         let is_archive = [".tar.gz", ".tgz", ".tar.xz", ".tar.bz2", ".tar.zst", ".zip"]
             .iter()

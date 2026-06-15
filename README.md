@@ -70,12 +70,30 @@ git-hosted and version-linked (`rev`/`tag`/`url` referencing `${version}`).
 
 **Dependency hash refresh:** `cargoHash`, `vendorHash`, `npmDepsHash`, `yarnHash`, `pomHash`, `mvnHash`, `mixHash`, `nugetHash`, `dotnetHash`.
 
+## CI
+
+[`examples/github-actions.yaml`](examples/github-actions.yaml) is a ready-to-copy workflow for GitHub Actions and Forgejo Actions. Drop it into `.github/workflows/bumpkin.yaml` inside your package set repository (not here).
+
+### Secrets
+
+| Secret | Required | Description |
+|---|---|---|
+| `GH_TOKEN` | yes | PAT with `contents:write` and `pull-requests:write` scope |
+
+### How it works
+
+The workflow triggers daily at 04:00 UTC and supports manual dispatch with an optional `maintainer` or `package` input to override the default target.
+
+Bumpkin is run via `nix run github:74k1/bumpkin` - no local build needed. Packages are updated with `--no-build`, meaning hashes are refreshed and changes are committed and pushed as PRs, but `nix build` is never invoked on the runner. This keeps jobs fast and avoids stalling on packages that take a long time to build.
+
+Replace `your-handle` in the workflow's run step with your nixpkgs maintainer handle before committing it to your repository.
+
 ## NixOS module
 
 Two module entry points:
 
-- `nixosModules.bumpkin` — raw module, requires explicit `services.bumpkin.package`
-- `nixosModules.default` — wraps the raw module and auto-sets `package` to `self.packages.${system}.default`
+- `nixosModules.bumpkin` - raw module, requires explicit `services.bumpkin.package`
+- `nixosModules.default` - wraps the raw module and auto-sets `package` to `self.packages.${system}.default`
 
 Use `default` unless you need a custom bumpkin derivation:
 
@@ -151,15 +169,15 @@ Use `default` unless you need a custom bumpkin derivation:
 
 ### Auth
 
-- `forgeTokenFile` — forge personal access token. Used for forge API calls (PR
+- `forgeTokenFile` - forge personal access token. Used for forge API calls (PR
   creation) and for HTTPS git transport when `git.sshKeyFile` is not set.
   Works with GitHub, Gitea, and Forgejo. The token is supplied through a git
   credential helper and a curl stdin config, so it never appears in remote
   URLs, `.git/config`, or process command lines.
-- `git.sshKeyFile` — SSH private key for git transport (clone, fetch, push).
+- `git.sshKeyFile` - SSH private key for git transport (clone, fetch, push).
   Takes priority over `forgeTokenFile` for git auth. The `forgeTokenFile` is
   still used for forge API calls.
-- `gpgKeyFile` — ASCII-armored GPG private key imported before each run.
+- `gpgKeyFile` - ASCII-armored GPG private key imported before each run.
 
 ### Inspecting
 

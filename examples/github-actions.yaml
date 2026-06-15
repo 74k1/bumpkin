@@ -1,0 +1,49 @@
+# Copy this file to .github/workflows/bumpkin.yaml in your package set repository.
+# Replace "your-handle" with your nixpkgs maintainer handle.
+name: bumpkin
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      maintainer:
+        description: "maintainer handle to update"
+        required: false
+      package:
+        description: "single package attribute to update"
+        required: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: cachix/install-nix-action@v31
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config --global user.name "bumpkin-bot"
+          git config --global user.email "bumpkin@users.noreply.github.com"
+
+      - name: Run bumpkin
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          INPUT_PACKAGE: ${{ inputs.package }}
+          INPUT_MAINTAINER: ${{ inputs.maintainer }}
+        run: |
+          if [ -n "$INPUT_PACKAGE" ]; then
+            TARGET=(--package "$INPUT_PACKAGE")
+          elif [ -n "$INPUT_MAINTAINER" ]; then
+            TARGET=(--maintainer "$INPUT_MAINTAINER")
+          else
+            TARGET=(--maintainer your-handle)
+          fi
+          nix run github:74k1/bumpkin -- update \
+            "${TARGET[@]}" --root . --no-build --commit --push --pr

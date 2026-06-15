@@ -1,4 +1,4 @@
-//! Repology version oracle — queries the free repology.org API to discover
+//! Repology version oracle - queries the free repology.org API to discover
 //! newer versions for packages without updateScripts.
 //!
 //! Rate limit: ~1 request/second. No API key required.

@@ -41,7 +41,7 @@ Bumpkin is a Rust/Nix flake upkeep bot. It should work for arbitrary flake packa
      fetcher is supported without bot-side prefetch code.
    - requires a version-linked source: a `rev`/`tag`/`url` assignment
      referencing `${version}`; pinned-rev packages are skipped.
-3. Repology API (last resort — version hint only, never drives updates)
+3. Repology API (last resort - version hint only, never drives updates)
 
 ## Project layout
 
@@ -79,15 +79,15 @@ then runs `bumpkin update --root <path> --maintainer <name>`.
 
 Options exposed to NixOS:
 - `services.bumpkin.enable`
-- `services.bumpkin.maintainers` — list of maintainer handles
-- `services.bumpkin.packageSets` — list of flake refs (string sugar) or attrsets with `repo`, `branch`, `path`, `forge`, `forgeApiUrl`, `noBuild`
-- `services.bumpkin.actions.commit` / `.signed` / `.push` / `.pr` — batch commit/push/PR behaviour
-- `services.bumpkin.forgeTokenFile` — path to forge PAT file (GitHub, Gitea, Forgejo)
-- `services.bumpkin.gpgKeyFile` — path to ASCII-armored GPG key for sign+import
+- `services.bumpkin.maintainers` - list of maintainer handles
+- `services.bumpkin.packageSets` - list of flake refs (string sugar) or attrsets with `repo`, `branch`, `path`, `forge`, `forgeApiUrl`, `noBuild`
+- `services.bumpkin.actions.commit` / `.signed` / `.push` / `.pr` - batch commit/push/PR behaviour
+- `services.bumpkin.forgeTokenFile` - path to forge PAT file (GitHub, Gitea, Forgejo)
+- `services.bumpkin.gpgKeyFile` - path to ASCII-armored GPG key for sign+import
 - `services.bumpkin.git.userName` / `.userEmail` / `.gpgFormat` / `.signingKey` / `.sshKeyFile` / `.extraConfig`
-- `services.bumpkin.schedule` / `.randomizedDelaySec` — timer tuning
-- `services.bumpkin.gc.enable` — periodic `nix store gc`
-- `services.bumpkin.package` — the bumpkin derivation (auto-set by `nixosModules.default`)
+- `services.bumpkin.schedule` / `.randomizedDelaySec` - timer tuning
+- `services.bumpkin.gc.enable` - periodic `nix store gc`
+- `services.bumpkin.package` - the bumpkin derivation (auto-set by `nixosModules.default`)
 
 ## Useful commands
 

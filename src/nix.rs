@@ -284,6 +284,10 @@ let
   legacyPackages = flake.legacyPackages.${{system}} or {{}};
   packages = legacyPackages // flakePackages;
   needle = "{maintainer}";
+  altNeedle =
+    if builtins.substring 0 1 needle == "_"
+    then builtins.substring 1 (builtins.stringLength needle - 1) needle
+    else "_" + needle;
 
   valueStrings = value:
     if value == null then []
@@ -302,7 +306,7 @@ let
     else [];
 
   maintainerMatches = maintainer:
-    builtins.any (value: value == needle) (maintainerStrings maintainer);
+    builtins.any (value: value == needle || value == altNeedle) (maintainerStrings maintainer);
 
   packageMatches = package:
     let result = builtins.tryEval (

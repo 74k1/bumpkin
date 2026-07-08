@@ -490,7 +490,7 @@ fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
 
     // The src must be derived from the version (rev/tag/url referencing
     // ${version}); otherwise bumping the version would not change the source.
-    let Some(prefix) = version_linked_prefix(&text) else {
+    let Some(prefix) = version_linked_prefix(&text, &old_version) else {
         return Err(repology_hint(
             &text,
             &old_version,
@@ -599,16 +599,24 @@ fn repology_hint(text: &str, old_version: &str, reason: &str) -> String {
 /// Find the tag prefix from the first rev/tag/url assignment that references
 /// the version, e.g. `rev = "v${version}"` -> "v",
 /// `url = ".../releases/download/app-${version}/x.tar.gz"` -> "app-".
-fn version_linked_prefix(text: &str) -> Option<String> {
+fn version_linked_prefix(text: &str, old_version: &str) -> Option<String> {
     for key in ["rev", "tag", "url"] {
         let Some(template) = extract_assignment(text, key) else {
             continue;
         };
+        // Template-linked: ${version} or ${finalAttrs.version} placeholder.
         for placeholder in ["${version}", "${finalAttrs.version}"] {
             if let Some((before, _)) = template.split_once(placeholder) {
                 let prefix = before.rsplit(['/', '=']).next().unwrap_or(before);
                 return Some(prefix.to_string());
             }
+        }
+        // Literal rev/tag: the value ends with the current version (e.g.
+        // "v1.2.3" with version "1.2.3" -> prefix "v").
+        if let Some(prefix) = template.strip_suffix(old_version)
+            && (!prefix.is_empty() || template == *old_version)
+        {
+            return Some(prefix.to_string());
         }
     }
     None
@@ -1000,21 +1008,26 @@ mod tests {
     #[test]
     fn version_linked_prefix_from_rev_tag_and_url() {
         assert_eq!(
-            version_linked_prefix(r#"rev = "v${version}";"#).as_deref(),
+            version_linked_prefix(r#"rev = "v${version}";"#, "1.0").as_deref(),
             Some("v")
         );
         assert_eq!(
-            version_linked_prefix(r#"tag = "release-${finalAttrs.version}";"#).as_deref(),
+            version_linked_prefix(r#"tag = "release-${finalAttrs.version}";"#, "1.0").as_deref(),
             Some("release-")
         );
         assert_eq!(
             version_linked_prefix(
-                r#"url = "https://github.com/o/r/releases/download/app-${version}/x.tar.gz";"#
+                r#"url = "https://github.com/o/r/releases/download/app-${version}/x.tar.gz";"#,
+                "1.0",
             )
             .as_deref(),
             Some("app-")
         );
-        assert_eq!(version_linked_prefix(r#"rev = "deadbeef";"#), None);
+        // SHA rev (not version-linked at all).
+        assert_eq!(version_linked_prefix(r#"rev = "deadbeef";"#, "1.0"), None);
+        // Literal rev ending with the version: recover prefix.
+        assert_eq!(version_linked_prefix(r#"rev = "v1.2.3";"#, "1.2.3").as_deref(), Some("v"));
+        assert_eq!(version_linked_prefix(r#"rev = "1.2.3";"#, "1.2.3").as_deref(), Some(""));
     }
 
     #[test]

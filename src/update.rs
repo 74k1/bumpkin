@@ -249,9 +249,11 @@ fn commit_update_one(
     );
     git::commit_paths(root, &changed_paths, &title, &body, commit.signed)?;
 
+    let mut commit_pushed_ok = false;
     if commit.push {
         match git::push_branch(root, &branch_name) {
             Ok(()) => {
+                commit_pushed_ok = true;
                 tracing::debug!("pushed branch {branch_name}");
                 if commit.pr {
                     let token = std::env::var("GITHUB_TOKEN").ok();
@@ -309,10 +311,15 @@ fn commit_update_one(
         BatchOutcome::UpdatedBuildFailed
     };
 
-    // Return to main and delete the per-package branch.
-    // Force-checkout discards any uncommitted changes (from failed builds, etc.).
+    // Return to main. Only drop the per-package branch once its commit is
+    // durably stored on the remote; on push failure (or when --push was not
+    // requested) keep the branch so the commit survives for inspection/retry.
     git::checkout_branch(root, main_branch)?;
-    let _ = git::delete_branch(root, &branch_name);
+    if commit_pushed_ok {
+        let _ = git::delete_branch(root, &branch_name);
+    } else {
+        tracing::warn!("{}: keeping branch {branch_name} (commit not on remote)", package);
+    }
     Ok(outcome)
 }
 
@@ -518,10 +525,25 @@ fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
         &format!("version = \"{latest}\";"),
         1,
     );
-
     // Fake out the src hash and all known dependency hashes, then let Nix
     // compute the real ones.
     text = replace_src_hash(&text, FAKE_HASH)?;
+
+    // Keep rev/tag in sync when it is a literal (not a `${version}` template).
+    // Only rewrite when the old value equals `prefix + old_version`.
+    for key in ["rev", "tag"] {
+        let Some(value) = extract_assignment(&text, key) else {
+            continue;
+        };
+        if value.contains("${version}") || value.contains("${finalAttrs.version}") {
+            continue;
+        }
+        if value == format!("{prefix}{old_version}") {
+            let old_assignment = format!("{key} = \"{value}\";");
+            let new_assignment = format!("{key} = \"{prefix}{latest}\";");
+            text = text.replacen(&old_assignment, &new_assignment, 1);
+        }
+    }
     let dep_hashes = dependency_hash_keys(&text);
     text = replace_dep_hashes_with_fake(&text, &dep_hashes);
     fs::write(&file, text).map_err(|e| format!("write {}: {e}", file.display()))?;
@@ -822,6 +844,7 @@ fn pr_title(package: &str, old_version: &str, new_version: &str) -> String {
     format!("feat({package}): {old_version} -> {new_version}")
 }
 
+#[allow(clippy::too_many_arguments, clippy::collapsible_if)]
 fn pr_body(
     package: &str,
     old_version: &str,

@@ -446,6 +446,7 @@ in builtins.concatStringsSep "\n" [
   (line "forge" (string "forge"))
   (line "forge_api_url" (string "forgeApiUrl"))
   (line "no_build" (list "noBuild"))
+  (line "skip" (list "skip"))
   (line "verbose" (bool "verbose"))
 ]
 "#,
@@ -476,6 +477,9 @@ in builtins.concatStringsSep "\n" [
                 "forge_api_url" => config.forge_api_url = Some(value.to_string()),
                 "no_build" => {
                     config.no_build = Some(value.split(",").map(|s| s.to_string()).collect());
+                }
+                "skip" => {
+                    config.skip = Some(value.split(",").map(|s| s.to_string()).collect());
                 }
                 "verbose" => config.verbose = Some(value == "1"),
                 _ => {}

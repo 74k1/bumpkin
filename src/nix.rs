@@ -242,8 +242,10 @@ let
     if legacyPackages ? writeShellScriptBin then legacyPackages
     else let
       pkgsInputs = builtins.filter (name:
-        let input = flake.inputs.${{name}} or {{}};
-        in input ? outPath && (import input {{}}).writeShellScriptBin or null != null
+        let
+          input = flake.inputs.${{name}} or {{}};
+          probe = builtins.tryEval (builtins.hasAttr "writeShellScriptBin" (import input {{}}));
+        in input ? outPath && probe.success && probe.value
       ) inputNames;
     in if pkgsInputs != [] then import flake.inputs.${{builtins.head pkgsInputs}} {{ inherit system; }}
     else null;

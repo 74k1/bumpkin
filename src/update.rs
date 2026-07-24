@@ -529,13 +529,18 @@ fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
     // compute the real ones.
     text = replace_src_hash(&text, FAKE_HASH)?;
 
-    // Keep rev/tag in sync when it is a literal (not a `${version}` template).
-    // Only rewrite when the old value equals `prefix + old_version`.
+    // Keep rev/tag in sync when it is a literal (not a template or
+    // bare variable reference).  Only rewrite when the old value equals
+    // `prefix + old_version`.
     for key in ["rev", "tag"] {
         let Some(value) = extract_assignment(&text, key) else {
             continue;
         };
-        if value.contains("${version}") || value.contains("${finalAttrs.version}") {
+        if value.contains("${version}")
+            || value.contains("${finalAttrs.version}")
+            || value == "version"
+            || value == "finalAttrs.version"
+        {
             continue;
         }
         if value == format!("{prefix}{old_version}") {
@@ -610,6 +615,10 @@ fn version_linked_prefix(text: &str, old_version: &str) -> Option<String> {
                 let prefix = before.rsplit(['/', '=']).next().unwrap_or(before);
                 return Some(prefix.to_string());
             }
+        }
+        // Bare variable reference: rev = version; or rev = finalAttrs.version;
+        if template == "version" || template == "finalAttrs.version" {
+            return Some(String::new());
         }
         // Literal rev/tag: the value ends with the current version (e.g.
         // "v1.2.3" with version "1.2.3" -> prefix "v").
@@ -733,7 +742,7 @@ fn find_executable_in_output(out: &Path) -> Result<PathBuf, String> {
 /// Extract the value of a `name = "value";` assignment. Requires `name` to
 /// start at an attribute boundary, so e.g. `rev` does not match `prev`.
 fn extract_assignment(text: &str, name: &str) -> Option<String> {
-    let needle = format!("{name} = \"");
+    let needle = format!("{name} = ");
     let mut from = 0;
     while let Some(pos) = text[from..].find(&needle) {
         let abs = from + pos;
@@ -744,8 +753,23 @@ fn extract_assignment(text: &str, name: &str) -> Option<String> {
             );
         if at_boundary {
             let start = abs + needle.len();
-            let end = text[start..].find('"')?;
-            return Some(text[start..start + end].to_string());
+            let rest = &text[start..];
+            let after = rest.trim_start();
+            let leading_ws = rest.len() - after.len();
+            if after.starts_with('"') {
+                // Quoted string assignment: name = "..."
+                let inner_start = start + leading_ws + 1;
+                let end = text[inner_start..].find('"')?;
+                return Some(text[inner_start..inner_start + end].to_string());
+            }
+            // Bare variable reference: name = ident;
+            // Match a single Nix identifier (letters, digits, dots, underscores).
+            for (i, c) in after.char_indices() {
+                if !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.') {
+                    return Some(after[..i].to_string());
+                }
+            }
+            return Some(after.to_string());
         }
         from = abs + needle.len();
     }
@@ -1028,6 +1052,15 @@ mod tests {
         // Literal rev ending with the version: recover prefix.
         assert_eq!(version_linked_prefix(r#"rev = "v1.2.3";"#, "1.2.3").as_deref(), Some("v"));
         assert_eq!(version_linked_prefix(r#"rev = "1.2.3";"#, "1.2.3").as_deref(), Some(""));
+        // Bare variable reference (rev = version; without quotes).
+        assert_eq!(
+            version_linked_prefix(r#"rev = version;"#, "1.0").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            version_linked_prefix(r#"rev = finalAttrs.version;"#, "1.0").as_deref(),
+            Some("")
+        );
     }
 
     #[test]
@@ -1101,6 +1134,18 @@ mod tests {
         assert_eq!(
             extract_assignment(r#"version = "1.2.3";"#, "version").as_deref(),
             Some("1.2.3")
+        );
+    }
+
+    #[test]
+    fn extract_assignment_handles_bare_variable_reference() {
+        assert_eq!(
+            extract_assignment(r#"rev = version;"#, "rev").as_deref(),
+            Some("version")
+        );
+        assert_eq!(
+            extract_assignment(r#"rev = finalAttrs.version;"#, "rev").as_deref(),
+            Some("finalAttrs.version")
         );
     }
 

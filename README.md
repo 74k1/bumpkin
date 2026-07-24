@@ -64,7 +64,10 @@ git URL, discovers new versions via `git ls-remote --tags` (works on any git
 host: GitHub, GitLab, sourcehut, Codeberg, Gitea, ...), then writes fake
 src/dependency hashes and lets `nix build` report the real ones. Since Nix runs
 the fetcher itself, every fetcher is supported as long as the source is
-git-hosted and version-linked (`rev`/`tag`/`url` referencing `${version}`).
+git-hosted and version-linked (`rev`/`tag`/`url` referencing `${version}`
+or bare `rev = version;`).  GitHub repository **transfers** are detected
+automatically (via 301 redirect) and the `owner`/`repo` fields are
+updated in-place before any update runs.
 
 **Forge backends:** `auto` (gh CLI if available, else GitHub REST API), `github-cli`, `github-api`, `api` (Gitea/Forgejo REST API).
 
@@ -189,6 +192,6 @@ systemctl list-timers 'bumpkin-*'
 
 ## Requirements
 
-Runtime: `nix` (with flakes), `git`, `jq`. Optional: `gh` (GitHub CLI), `gnupg` (GPG signing), `openssh` (SSH push).
+Runtime: `nix` (with flakes), `git`, `jq`, `curl`. Optional: `gh` (GitHub CLI), `gnupg` (GPG signing), `openssh` (SSH push).
 
 Repository shape: flake root with `flake.nix`, packages at `packages.$system.<attr>` or `legacyPackages.$system.<attr>`.

@@ -40,7 +40,8 @@ Bumpkin is a Rust/Nix flake upkeep bot. It should work for arbitrary flake packa
      mismatch errors, loop until none remain. Nix runs the fetcher, so every
      fetcher is supported without bot-side prefetch code.
    - requires a version-linked source: a `rev`/`tag`/`url` assignment
-     referencing `${version}`; pinned-rev packages are skipped.
+     referencing `${version}` (or bare `version`/`finalAttrs.version`);
+     pinned-rev packages are skipped.
 3. Repology API (last resort - version hint only, never drives updates)
 
 ## Project layout
@@ -51,7 +52,8 @@ src/
   lib.rs         # Clap CLI structs (Commands, flags), config loading, command dispatch
   update.rs      # Update logic: dry-run, per-package update, batch maintainer update,
                  #   native updater (git ls-remote tags + Nix-computed hashes),
-                 #   fake-hash refresh loop (src + cargoHash, vendorHash, npmDepsHash, etc.)
+                 #   fake-hash refresh loop (src + cargoHash, vendorHash, npmDepsHash, etc.),
+                 #   GitHub redirect detection (updates owner/repo on transfer)
   packages.rs    # Package discovery, maintainer filtering, fetcher classification
   nix.rs         # Nix evaluation: package version, build, updateScript, maintainer query,
                  #   src info (gitRepoUrl/urls), flake input info (nixpkgs rev for PR bodies)
@@ -126,6 +128,9 @@ nix flake check
 - Repology is a fallback version hint only; it does not drive the primary update flow.
 - Registry-based sources (`fetchPypi`, `fetchCrate`, ...) and non-git VCSes still need updateScripts; the native updater handles git-hosted sources only.
 - Non-numeric versions (rc/beta tags, `unstable-…` dates) are skipped by the native updater.
+- GitHub repo transfers are detected via 301 redirect and the `owner`/`repo`
+  fields in the nix file are updated automatically; the redirect check runs
+  before any updateScript or native-fetcher update.
 - Multi-platform builds are not supported; bumpkin builds only on the local system.
 - No CVE checking or rebuild-impact estimation (unlike nixpkgs-update).
 - Forge PR dedup covers `gh` CLI, GitHub REST API, and Gitea/Forgejo REST API. Gitea/Forgejo do not support the `head=` filter, so matching is done client-side on `head.ref`.

@@ -449,6 +449,11 @@ pub fn run_update_script_direct(root: &Path, package: &str) -> Result<(), String
 }
 
 fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
+    // Detect and fix GitHub repository transfers before running updates.
+    if let Err(e) = fix_repo_redirect(root, package) {
+        tracing::debug!("{package}: redirect check skipped: {e}");
+    }
+
     tracing::debug!("{package}: trying updateScript...");
     match nix::build_update_script(root, package) {
         Ok(script_out) => {
@@ -780,6 +785,76 @@ fn extract_assignment(text: &str, name: &str) -> Option<String> {
 fn owner_repo_from_url(url: &str) -> Result<(String, String), String> {
     let (_, owner, repo) = forge::parse_repo_url(url)?;
     Ok((owner, repo))
+}
+
+/// Check if a GitHub repository has been transferred/renamed.
+/// Returns `Some((new_owner, new_repo))` if the repo redirects.
+fn check_github_redirect(url: &str) -> Option<(String, String)> {
+    if !url.contains("github.com") {
+        return None;
+    }
+    let web_url = url
+        .strip_prefix("git+")
+        .unwrap_or(url)
+        .strip_suffix(".git")
+        .unwrap_or(url);
+    let output = Command::new("curl")
+        .args([
+            "-s", "-o", "/dev/null", "-w", "%{redirect_url}",
+            "--max-time", "5",
+            web_url,
+        ])
+        .output()
+        .ok()?;
+    let redirect = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if redirect.is_empty() || redirect == web_url {
+        return None;
+    }
+    let (_, new_owner, new_repo) = forge::parse_repo_url(&redirect).ok()?;
+    let (_, old_owner, old_repo) = forge::parse_repo_url(web_url).ok()?;
+    if new_owner != old_owner || new_repo != old_repo {
+        Some((new_owner, new_repo))
+    } else {
+        None
+    }
+}
+
+/// Check whether the Git remote for a package has been transferred/renamed
+/// (currently GitHub only).  When a redirect is detected the `owner` and
+/// `repo` fields in the source file are rewritten in-place.
+fn fix_repo_redirect(root: &Path, package: &str) -> Result<(), String> {
+    let src = nix::src_info(root, package)?;
+    let Some(git_url) = git_url_from_src(&src.git_repo_url, &src.urls) else {
+        return Ok(());
+    };
+    let Some((new_owner, new_repo)) = check_github_redirect(&git_url) else {
+        return Ok(());
+    };
+    let Some(file) = packages::file_for_attr(root, package) else {
+        return Ok(());
+    };
+    let mut text =
+        fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+    let mut changed = false;
+    for (field, new_val) in [("owner", new_owner.as_str()), ("repo", new_repo.as_str())] {
+        if let Some(old_val) = extract_assignment(&text, field) {
+            if old_val != new_val {
+                let old = format!("{field} = \"{old_val}\";");
+                let new = format!("{field} = \"{new_val}\";");
+                text = text.replacen(&old, &new, 1);
+                tracing::warn!("{package}: {field} changed ({old_val} -> {new_val})");
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        fs::write(&file, text)
+            .map_err(|e| format!("write {}: {e}", file.display()))?;
+        tracing::info!(
+            "{package}: updated owner/repo ({new_owner}/{new_repo})"
+        );
+    }
+    Ok(())
 }
 
 fn replace_src_hash(text: &str, new_hash: &str) -> Result<String, String> {

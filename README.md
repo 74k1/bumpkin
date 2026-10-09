@@ -52,6 +52,9 @@ bumpkin update --package arcbrush --root $HOME/dev/tixpkgs --commit --signed --p
 # Batch maintainer: per-package branches, commit, push, PR
 bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --signed --push --pr
 
+# Custom branch names (default prefix: bumpkin/ -> bumpkin/<package>)
+bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --branch-prefix "upkeep/"
+
 # Per-machine blocklist (works for dry-run and update)
 BUMPKIN_SKIP=waterfox,waterfox-unwrapped bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs
 bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build waterfox,waterfox-unwrapped
@@ -62,7 +65,8 @@ bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build wa
 **updateScripts:** Nix builds a bare-path script (for example `./update.sh`) into a
 read-only file in the Nix store. A script that writes next to itself then fails. If the
 package directory in the checkout contains a file with identical content, bumpkin runs
-that copy instead. The checkout directory is writable.
+that copy instead. The checkout directory is writable. If an updateScript fails,
+bumpkin reports the error and does not fall back to the native updater.
 
 **Native updater:** evaluates the package's `src` with Nix to find the upstream
 git URL, discovers new versions via `git ls-remote --tags` (works on any git
@@ -70,7 +74,9 @@ host: GitHub, GitLab, sourcehut, Codeberg, Gitea, ...), then writes fake
 src/dependency hashes and lets `nix build` report the real ones. Since Nix runs
 the fetcher itself, every fetcher is supported as long as the source is
 git-hosted and version-linked (`rev`/`tag`/`url` referencing `${version}`
-or bare `rev = version;`).  GitHub repository **transfers** are detected
+or bare `rev = version;`). `rev`/`tag`/`url` and the src hash are read from
+the `src = fetcher { ... }` attrset first, so patch URLs and hashes elsewhere in
+the file are left alone.  GitHub repository **transfers** are detected
 automatically (via 301 redirect) and the `owner`/`repo` fields are
 updated in-place before any update runs.
 
@@ -118,7 +124,7 @@ Use `default` unless you need a custom bumpkin derivation:
     packageSets = [
       "github:74k1/tixpkgs"
       { repo = "github:74k1/tixpkgs"; noBuild = [ "waterfox" "waterfox-unwrapped" ]; }
-      { repo = "https://git.example.com/org/pkgs.git"; forge = "api"; forgeApiUrl = "https://git.example.com/api/v1"; }
+      { repo = "https://git.example.com/org/pkgs.git"; forge = "api"; forgeApiUrl = "https://git.example.com/api/v1"; branchPrefix = "upkeep/"; }
     ];
 
     actions = {
@@ -157,6 +163,8 @@ Use `default` unless you need a custom bumpkin derivation:
 | `packageSets.*.forge` | null or str | `null` | Forge backend override (null = auto-detect) |
 | `packageSets.*.forgeApiUrl` | null or str | `null` | API URL for `api` forge |
 | `packageSets.*.noBuild` | list of str | `[]` | Package attr names to skip building (still update/commit/PR) |
+| `packageSets.*.branchPrefix` | null or str | `null` | Branch prefix override for this set (null = `branchPrefix`) |
+| `branchPrefix` | str | `"bumpkin/"` | Per-package branch name prefix (`<prefix><package>`, no separator added) |
 | `actions.commit` | bool | `false` | Create per-package commits |
 | `actions.signed` | bool | `false` | GPG/SSH sign commits |
 | `actions.push` | bool | `false` | Push branches to origin |

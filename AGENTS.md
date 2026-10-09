@@ -42,6 +42,9 @@ Bumpkin is a Rust/Nix flake upkeep bot. It should work for arbitrary flake packa
    - requires a version-linked source: a `rev`/`tag`/`url` assignment
      referencing `${version}` (or bare `version`/`finalAttrs.version`);
      pinned-rev packages are skipped.
+   - `rev`/`tag`/`url` and the src hash are looked up inside the
+     `src = fetcher { ... }` attrset first (whole file as fallback), so
+     `fetchpatch` URLs/hashes are not mistaken for the source.
 3. Repology API (last resort - version hint only, never drives updates)
 
 ## Project layout
@@ -82,7 +85,8 @@ then runs `bumpkin update --root <path> --maintainer <name>`.
 Options exposed to NixOS:
 - `services.bumpkin.enable`
 - `services.bumpkin.maintainers` - list of maintainer handles
-- `services.bumpkin.packageSets` - list of flake refs (string sugar) or attrsets with `repo`, `branch`, `path`, `forge`, `forgeApiUrl`, `noBuild`
+- `services.bumpkin.packageSets` - list of flake refs (string sugar) or attrsets with `repo`, `branch`, `path`, `forge`, `forgeApiUrl`, `noBuild`, `branchPrefix`
+- `services.bumpkin.branchPrefix` - per-package branch prefix (default `bumpkin/`); per-packageSet `branchPrefix` overrides it
 - `services.bumpkin.actions.commit` / `.signed` / `.push` / `.pr` - batch commit/push/PR behaviour
 - `services.bumpkin.forgeTokenFile` - path to forge PAT file (GitHub, Gitea, Forgejo)
 - `services.bumpkin.gpgKeyFile` - path to ASCII-armored GPG key for sign+import
@@ -125,6 +129,9 @@ nix flake check
 - Bare-path updateScripts flattened into the read-only store are run from a byte-identical
   copy in the checkout's package directory (probed write access, content match), so scripts
   that write next to themselves work.
+- Per-package branches are `<branchPrefix><package>` (`--branch-prefix` / config `branchPrefix`, default `bumpkin/`). The prefix must be non-empty because leftover branches with that name are force-deleted at the start of each package.
+- A failing updateScript is reported as an error; the native updater is only used when no updateScript exists.
+- Diffs are printed only with `--verbose` (git writes them straight to stdout).
 - `update --maintainer --commit` runs per-package branches sequentially; it does not parallelize across packages (Nix builds are single-instance anyway).
 - `update --package` supports `--commit --push --pr` too (per-package branch flow, same as batch mode); `--push` requires `--commit`, `--pr` requires `--push`.
 - Commit mode refuses to run from a detached HEAD (no branch to return to).

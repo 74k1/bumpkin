@@ -18,14 +18,14 @@ pub fn resolve(
 
         "github-api" => {
             let token = token
-                .ok_or("forge `github-api` requires a token (set GITHUB_TOKEN or ghTokenFile)")?;
+                .ok_or("forge `github-api` requires a token (set GITHUB_TOKEN, or forgeTokenFile in the NixOS module)")?;
             CompatibleApi::new(token, repo_url, Some("https://api.github.com"))
                 .map(ForgeBackend::CompatibleApi)
         }
 
         "api" => {
             let token =
-                token.ok_or("forge `api` requires a token (set GITHUB_TOKEN or ghTokenFile)")?;
+                token.ok_or("forge `api` requires a token (set GITHUB_TOKEN, or forgeTokenFile in the NixOS module)")?;
             let base = api_url.ok_or("forge `api` requires --forge-api-url")?;
             CompatibleApi::new(token, repo_url, Some(base)).map(ForgeBackend::CompatibleApi)
         }
@@ -36,7 +36,7 @@ pub fn resolve(
                 return Ok(ForgeBackend::GitHubCli(GitHubCli));
             }
             let token = token
-                .ok_or("forge `auto` fell back to GitHub API but no token is available (set GITHUB_TOKEN or ghTokenFile)")?;
+                .ok_or("forge `auto` fell back to GitHub API but no token is available (set GITHUB_TOKEN, or forgeTokenFile in the NixOS module)")?;
             CompatibleApi::new(token, repo_url, Some("https://api.github.com"))
                 .map(ForgeBackend::CompatibleApi)
         }

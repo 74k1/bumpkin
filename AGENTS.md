@@ -122,6 +122,9 @@ nix flake check
 
 - Maintainer scans default to evaluating `packages.$system.*.meta.maintainers`; source scanning is a fallback.
 - `run-update-script` supports flake package outputs, checks `passthru.updateScript` plus top-level `updateScript`.
+- Bare-path updateScripts flattened into the read-only store are run from a byte-identical
+  copy in the checkout's package directory (probed write access, content match), so scripts
+  that write next to themselves work.
 - `update --maintainer --commit` runs per-package branches sequentially; it does not parallelize across packages (Nix builds are single-instance anyway).
 - `update --package` supports `--commit --push --pr` too (per-package branch flow, same as batch mode); `--push` requires `--commit`, `--pr` requires `--push`.
 - Commit mode refuses to run from a detached HEAD (no branch to return to).

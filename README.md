@@ -21,7 +21,7 @@
 > I'm still learning rust and I needed something quick to do the updating of packages in my own repository (just [tixpkgs](https://github.com/74k1/tixpkgs)).
 > I can promise, that once I've learned rust on a level where I can take a big look at this codebase, I'll rewrite it by hand. (The logo for example, is already handmade. Thanks to a friend for the Idea.)
 
-Finds packages by maintainer, runs update scripts (or native fetcher updaters), builds, commits, pushes, opens PRs.
+Bumpkin finds packages by maintainer. For each package it runs the package update script, or the native updater. It then builds the package and can commit, push, and open a pull request.
 
 [Here](https://github.com/74k1/tix/blob/main/modules/nixos/daemons/bumpkin/default.nix)'s an example of how I set it up with the NixOS Module.
 
@@ -59,6 +59,11 @@ bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build wa
 
 **Update priority:** package-owned `updateScript` → native updater → Repology (version hint only).
 
+**updateScripts:** Nix builds a bare-path script (for example `./update.sh`) into a
+read-only file in the Nix store. A script that writes next to itself then fails. If the
+package directory in the checkout contains a file with identical content, bumpkin runs
+that copy instead. The checkout directory is writable.
+
 **Native updater:** evaluates the package's `src` with Nix to find the upstream
 git URL, discovers new versions via `git ls-remote --tags` (works on any git
 host: GitHub, GitLab, sourcehut, Codeberg, Gitea, ...), then writes fake
@@ -69,13 +74,13 @@ or bare `rev = version;`).  GitHub repository **transfers** are detected
 automatically (via 301 redirect) and the `owner`/`repo` fields are
 updated in-place before any update runs.
 
-**Forge backends:** `auto` (gh CLI if available, else GitHub REST API), `github-cli`, `github-api`, `api` (Gitea/Forgejo REST API).
+**Forge backends:** `auto` (the `gh` CLI if it is installed, otherwise the GitHub REST API), `github-cli`, `github-api`, `api` (Gitea/Forgejo REST API).
 
 **Dependency hash refresh:** `cargoHash`, `vendorHash`, `npmDepsHash`, `yarnHash`, `pomHash`, `mvnHash`, `mixHash`, `nugetHash`, `dotnetHash`.
 
 ## CI
 
-[`examples/github-actions.yaml`](examples/github-actions.yaml) is a ready-to-copy workflow for GitHub Actions and Forgejo Actions. Drop it into `.github/workflows/bumpkin.yaml` inside your package set repository (not here).
+[`examples/github-actions.yaml`](examples/github-actions.yaml) is a workflow you can copy. It works with GitHub Actions and Forgejo Actions. Copy it to `.github/workflows/bumpkin.yaml` inside your package set repository (not here).
 
 ### Secrets
 
@@ -85,11 +90,11 @@ updated in-place before any update runs.
 
 ### How it works
 
-The workflow triggers daily at 04:00 UTC and supports manual dispatch with an optional `maintainer` or `package` input to override the default target.
+The workflow runs daily at 04:00 UTC. You can also start it manually with an optional `maintainer` or `package` input to override the default target.
 
-Bumpkin is run via `nix run github:74k1/bumpkin` - no local build needed. Packages are updated with `--no-build`, meaning hashes are refreshed and changes are committed and pushed as PRs, but `nix build` is never invoked on the runner. This keeps jobs fast and avoids stalling on packages that take a long time to build.
+The runner starts bumpkin with `nix run github:74k1/bumpkin`, so no local build is necessary. Packages are updated with `--no-build`: bumpkin refreshes the hashes and commits and pushes the changes as pull requests. It does not run `nix build` on the runner. This keeps the job fast and does not stall on packages that build for a long time.
 
-Replace `your-handle` in the workflow's run step with your nixpkgs maintainer handle before committing it to your repository.
+Before you commit the workflow to your repository, replace `your-handle` in the run step with your nixpkgs maintainer handle.
 
 ## NixOS module
 
@@ -172,15 +177,16 @@ Use `default` unless you need a custom bumpkin derivation:
 
 ### Auth
 
-- `forgeTokenFile` - forge personal access token. Used for forge API calls (PR
-  creation) and for HTTPS git transport when `git.sshKeyFile` is not set.
-  Works with GitHub, Gitea, and Forgejo. The token is supplied through a git
-  credential helper and a curl stdin config, so it never appears in remote
-  URLs, `.git/config`, or process command lines.
+- `forgeTokenFile` - forge personal access token. Bumpkin uses it for forge
+  API calls (PR creation) and for HTTPS git transport when `git.sshKeyFile`
+  is not set. It works with GitHub, Gitea, and Forgejo. The token is supplied
+  through a git credential helper and a curl stdin config. It therefore never
+  appears in remote URLs, `.git/config`, or process command lines.
 - `git.sshKeyFile` - SSH private key for git transport (clone, fetch, push).
-  Takes priority over `forgeTokenFile` for git auth. The `forgeTokenFile` is
-  still used for forge API calls.
-- `gpgKeyFile` - ASCII-armored GPG private key imported before each run.
+  It takes priority over `forgeTokenFile` for git auth. Bumpkin still uses
+  `forgeTokenFile` for forge API calls.
+- `gpgKeyFile` - ASCII-armored GPG private key. Bumpkin imports it before
+  each run.
 
 ### Inspecting
 

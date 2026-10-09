@@ -40,10 +40,13 @@ pub fn dry_run_package(root: &Path, package: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    tracing::debug!("--- diffstat ---");
-    git::print_diff_stat(worktree.path())?;
-    tracing::debug!("--- diff ---");
-    git::print_diff(worktree.path())?;
+    // git writes the diff straight to stdout, so gate it on the log level.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!("--- diffstat ---");
+        git::print_diff_stat(worktree.path())?;
+        tracing::debug!("--- diff ---");
+        git::print_diff(worktree.path())?;
+    }
     tracing::debug!("--- build ---");
     if nix::build_package(worktree.path(), package)? {
         tracing::info!("{package}: build ok");
@@ -205,8 +208,10 @@ fn commit_update_one(
     let new_version = nix::package_version(root, package).unwrap_or_else(|_| "unknown".to_string());
     let title = pr_title(package, &old_version, &new_version);
 
-    tracing::debug!("diffstat:");
-    git::print_diff_stat(root)?;
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::debug!("diffstat:");
+        git::print_diff_stat(root)?;
+    }
 
     let build_skipped = commit.no_build.iter().any(|s| s == package);
 

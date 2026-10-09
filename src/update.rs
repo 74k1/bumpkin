@@ -448,6 +448,50 @@ pub fn run_update_script_direct(root: &Path, package: &str) -> Result<(), String
     run_update_script(root, package)
 }
 
+/// Pure-flake evaluation flattens bare-path updateScripts (e.g. `./update.sh`)
+/// into a single read-only store file named after the source tree, so scripts
+/// that write next to themselves fail. If the checkout's package directory
+/// contains a file with identical content, return that copy - writable
+/// directory, same script. This mirrors how nixpkgs' update.py runs scripts
+/// from the checkout rather than the store.
+fn dir_is_writable(dir: &Path) -> bool {
+    // Mode-bit checks lie for group-writable dirs like /nix/store (1775).
+    // Probe with an actual create, which respects the effective uid.
+    let probe = dir.join(".bumpkin-write-probe");
+    let created = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe);
+    if created.is_ok() {
+        let _ = fs::remove_file(&probe);
+        true
+    } else {
+        false
+    }
+}
+
+fn writable_script_copy(root: &Path, package: &str, store_script: &Path) -> Option<PathBuf> {
+    if !store_script.is_file() {
+        return None;
+    }
+    if dir_is_writable(store_script.parent()?) {
+        return None;
+    }
+    let store_bytes = fs::read(store_script).ok()?;
+    let dir = packages::file_for_attr(root, package)?.parent()?.to_path_buf();
+    let entries = fs::read_dir(&dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || path.extension().is_some_and(|ext| ext == "nix") {
+            continue;
+        }
+        if fs::read(&path).is_ok_and(|bytes| bytes == store_bytes) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
     // Detect and fix GitHub repository transfers before running updates.
     if let Err(e) = fix_repo_redirect(root, package) {
@@ -458,6 +502,7 @@ fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
     match nix::build_update_script(root, package) {
         Ok(script_out) => {
             let script = find_executable_in_output(Path::new(&script_out))?;
+            let script = writable_script_copy(root, package, &script).unwrap_or(script);
             let status = Command::new(&script)
                 .current_dir(root)
                 .status()

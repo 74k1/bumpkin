@@ -29,7 +29,9 @@ fn main() {
     let filter =
         EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| EnvFilter::new(default_directive));
 
+    // Logs go to stderr; stdout is reserved for data (`list`, `list --json`).
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_target(false)
         .with_level(true)

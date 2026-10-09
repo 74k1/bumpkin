@@ -512,10 +512,15 @@ fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
                 .current_dir(root)
                 .status()
                 .map_err(|e| format!("run {}: {e}", script.display()))?;
+            // No native fallback here: a broken updateScript should surface,
+            // not be papered over by a different update path.
             if status.success() {
                 Ok(())
             } else {
-                Err(format!("{} exited with {status}", script.display()))
+                Err(format!(
+                    "updateScript {} exited with {status}; native updater not attempted",
+                    script.display()
+                ))
             }
         }
         Err(err) => {

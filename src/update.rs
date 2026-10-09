@@ -1042,8 +1042,18 @@ fn parse_version(version: &str) -> Option<Vec<u64>> {
     version.split('.').map(|p| p.parse().ok()).collect()
 }
 
+/// Numeric comparison where missing trailing components count as 0, so
+/// `1.2.0` is not newer than `1.2`. Non-numeric versions sort lowest.
 fn version_gt(a: &str, b: &str) -> bool {
-    parse_version(a) > parse_version(b)
+    match (parse_version(a), parse_version(b)) {
+        (Some(mut a), Some(mut b)) => {
+            let len = a.len().max(b.len());
+            a.resize(len, 0);
+            b.resize(len, 0);
+            a > b
+        }
+        (a, b) => a > b,
+    }
 }
 
 fn pr_title(package: &str, old_version: &str, new_version: &str) -> String {
@@ -1390,6 +1400,8 @@ mod tests {
     fn numeric_version_ordering_works() {
         assert!(version_gt("1.10.0", "1.9.9"));
         assert!(!version_gt("1.0.0", "1.0.1"));
+        assert!(!version_gt("1.2.0", "1.2"));
+        assert!(version_gt("1.2.1", "1.2"));
         assert_eq!(parse_version("1.2.3"), Some(vec![1, 2, 3]));
         assert_eq!(parse_version("1.2-beta"), None);
     }

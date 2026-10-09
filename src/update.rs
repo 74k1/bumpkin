@@ -550,7 +550,11 @@ fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
 
     // The src must be derived from the version (rev/tag/url referencing
     // ${version}); otherwise bumping the version would not change the source.
-    let Some(prefix) = version_linked_prefix(&text, &old_version) else {
+    // Look in the src fetcher first so an unrelated url (patches, etc.) can't
+    // win; fall back to the whole file for src attrs bound elsewhere.
+    let Some(prefix) = version_linked_prefix(src_scope(&text), &old_version)
+        .or_else(|| version_linked_prefix(&text, &old_version))
+    else {
         return Err(repology_hint(
             &text,
             &old_version,
@@ -593,7 +597,7 @@ fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
     // bare variable reference).  Only rewrite when the old value equals
     // `prefix + old_version`.
     for key in ["rev", "tag"] {
-        let Some(value) = extract_assignment(&text, key) else {
+        let Some(value) = extract_assignment(src_scope(&text), key) else {
             continue;
         };
         if value.contains("${version}")
@@ -606,7 +610,9 @@ fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
         if value == format!("{prefix}{old_version}") {
             let old_assignment = format!("{key} = \"{value}\";");
             let new_assignment = format!("{key} = \"{prefix}{latest}\";");
-            text = text.replacen(&old_assignment, &new_assignment, 1);
+            let (start, end) = src_block_range(&text).unwrap_or((0, text.len()));
+            let scope = text[start..end].replacen(&old_assignment, &new_assignment, 1);
+            text.replace_range(start..end, &scope);
         }
     }
     let dep_hashes = dependency_hash_keys(&text);
@@ -799,9 +805,9 @@ fn find_executable_in_output(out: &Path) -> Result<PathBuf, String> {
     Err(format!("could not find executable in {}", out.display()))
 }
 
-/// Extract the value of a `name = "value";` assignment. Requires `name` to
-/// start at an attribute boundary, so e.g. `rev` does not match `prev`.
-fn extract_assignment(text: &str, name: &str) -> Option<String> {
+/// Byte offset just past the first `name = ` that starts at an attribute
+/// boundary, so e.g. `rev` does not match `prev`.
+fn assignment_value_start(text: &str, name: &str) -> Option<usize> {
     let needle = format!("{name} = ");
     let mut from = 0;
     while let Some(pos) = text[from..].find(&needle) {
@@ -812,28 +818,63 @@ fn extract_assignment(text: &str, name: &str) -> Option<String> {
                 b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'\''
             );
         if at_boundary {
-            let start = abs + needle.len();
-            let rest = &text[start..];
-            let after = rest.trim_start();
-            let leading_ws = rest.len() - after.len();
-            if after.starts_with('"') {
-                // Quoted string assignment: name = "..."
-                let inner_start = start + leading_ws + 1;
-                let end = text[inner_start..].find('"')?;
-                return Some(text[inner_start..inner_start + end].to_string());
-            }
-            // Bare variable reference: name = ident;
-            // Match a single Nix identifier (letters, digits, dots, underscores).
-            for (i, c) in after.char_indices() {
-                if !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.') {
-                    return Some(after[..i].to_string());
-                }
-            }
-            return Some(after.to_string());
+            return Some(abs + needle.len());
         }
         from = abs + needle.len();
     }
     None
+}
+
+/// Extract the value of a `name = "value";` assignment.
+fn extract_assignment(text: &str, name: &str) -> Option<String> {
+    let start = assignment_value_start(text, name)?;
+    let rest = &text[start..];
+    let after = rest.trim_start();
+    let leading_ws = rest.len() - after.len();
+    if after.starts_with('"') {
+        // Quoted string assignment: name = "..."
+        let inner_start = start + leading_ws + 1;
+        let end = text[inner_start..].find('"')?;
+        return Some(text[inner_start..inner_start + end].to_string());
+    }
+    // Bare variable reference: name = ident;
+    // Match a single Nix identifier (letters, digits, dots, underscores).
+    for (i, c) in after.char_indices() {
+        if !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '.') {
+            return Some(after[..i].to_string());
+        }
+    }
+    Some(after.to_string())
+}
+
+/// Byte range of the `{ ... }` argument of `src = fetcher { ... }`, so lookups
+/// of rev/tag/url/hash do not pick up patches or other fetchers in the file.
+/// `None` when src is not a fetcher call with an inline attrset.
+fn src_block_range(text: &str) -> Option<(usize, usize)> {
+    let start = assignment_value_start(text, "src")?;
+    let open = start + text[start..].find('{')?;
+    if text[start..open].contains(';') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (i, ch) in text[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open, open + i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The src fetcher's attrset if there is one, otherwise the whole file.
+fn src_scope(text: &str) -> &str {
+    src_block_range(text).map_or(text, |(start, end)| &text[start..end])
 }
 
 /// Extract (owner, repo) from a git remote URL.
@@ -913,14 +954,17 @@ fn fix_repo_redirect(root: &Path, package: &str) -> Result<(), String> {
 }
 
 fn replace_src_hash(text: &str, new_hash: &str) -> Result<String, String> {
-    let src_pos = text.find("src = ").ok_or("missing src assignment")?;
-    let after = &text[src_pos..];
-    let (hash_rel, needle_len) = ["hash = \"", "sha256 = \""]
+    let src_pos = assignment_value_start(text, "src").ok_or("missing src assignment")?;
+    // Prefer the src fetcher's own attrset; fall back to "anything after src".
+    let (scope_start, scope_end) = src_block_range(text).unwrap_or((src_pos, text.len()));
+    let scope = &text[scope_start..scope_end];
+    let value_start = ["hash", "sha256"]
         .into_iter()
-        .filter_map(|needle| after.find(needle).map(|rel| (rel, needle.len())))
-        .min_by_key(|(rel, _)| *rel)
+        .filter_map(|name| assignment_value_start(scope, name))
+        .filter(|&pos| scope[pos..].starts_with('"'))
+        .min()
         .ok_or("missing src hash")?;
-    let start = src_pos + hash_rel + needle_len;
+    let start = scope_start + value_start + 1;
     let end = start + text[start..].find('"').ok_or("unterminated src hash")?;
     let mut out = String::with_capacity(text.len() + new_hash.len());
     out.push_str(&text[..start]);
@@ -1293,6 +1337,45 @@ mod tests {
         )
         .unwrap();
         assert!(sha.contains("sha256 = \"sha256-new\""));
+    }
+
+    // A patch hash (or any other fetcher) after `src = ` must not be mistaken
+    // for the src hash, and `outputHash`-style names must not match `hash`.
+    const SRC_WITH_PATCH: &str = r#"
+  src = fetchFromGitHub {
+    owner = "o";
+    repo = "r";
+    rev = "v1.0";
+    hash = "sha256-src";
+  };
+  patches = [
+    (fetchpatch {
+      url = "https://example.com/fix-${version}.patch";
+      hash = "sha256-patch";
+    })
+  ];
+"#;
+
+    #[test]
+    fn src_hash_replacement_stays_inside_src_block() {
+        let reordered = SRC_WITH_PATCH.replace(
+            "    rev = \"v1.0\";\n    hash = \"sha256-src\";\n",
+            "    outputHash = \"x\";\n    rev = \"v1.0\";\n    sha256 = \"sha256-src\";\n",
+        );
+        let hashed = replace_src_hash(&reordered, "sha256-new").unwrap();
+        assert!(hashed.contains("sha256 = \"sha256-new\""));
+        assert!(hashed.contains("outputHash = \"x\""));
+        assert!(hashed.contains("hash = \"sha256-patch\""));
+    }
+
+    #[test]
+    fn src_scope_prefers_src_fetcher_over_patch_urls() {
+        // The patch url references ${version}, but the src rev is the link.
+        assert_eq!(
+            version_linked_prefix(src_scope(SRC_WITH_PATCH), "1.0").as_deref(),
+            Some("v")
+        );
+        assert_eq!(src_block_range("src = ./.;\nfoo = { };"), None);
     }
 
     #[test]

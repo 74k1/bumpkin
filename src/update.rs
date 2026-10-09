@@ -231,17 +231,7 @@ fn commit_update_one(
     if let Some(key) = commit.signing_key.as_deref() {
         git::run(root, &["config", "user.signingkey", key])?;
     }
-    let (nixpkgs_input, nixpkgs_rev) = nix::flake_input_info(root).unwrap_or_default();
-    let nixpkgs_in = if nixpkgs_input.is_empty() {
-        None
-    } else {
-        Some(nixpkgs_input.as_str())
-    };
-    let nixpkgs_rv = if nixpkgs_rev.is_empty() {
-        None
-    } else {
-        Some(nixpkgs_rev.as_str())
-    };
+    let (nixpkgs_input, nixpkgs_rev) = nixpkgs_input_info(root);
     let body = pr_body(
         package,
         &old_version,
@@ -249,8 +239,8 @@ fn commit_update_one(
         build_ok,
         build_skipped,
         Some(&build_log),
-        nixpkgs_in,
-        nixpkgs_rv,
+        nixpkgs_input.as_deref(),
+        nixpkgs_rev.as_deref(),
     );
     git::commit_paths(root, &changed_paths, &title, &body, commit.signed)?;
 
@@ -404,17 +394,7 @@ pub fn update_package(root: &Path, package: &str, commit: CommitOptions) -> Resu
             return Err("build failed; leaving changes in working tree".to_string());
         }
     }
-    let (nixpkgs_input, nixpkgs_rev) = nix::flake_input_info(root).unwrap_or_default();
-    let nixpkgs_in = if nixpkgs_input.is_empty() {
-        None
-    } else {
-        Some(nixpkgs_input.as_str())
-    };
-    let nixpkgs_rv = if nixpkgs_rev.is_empty() {
-        None
-    } else {
-        Some(nixpkgs_rev.as_str())
-    };
+    let (nixpkgs_input, nixpkgs_rev) = nixpkgs_input_info(root);
     let body = pr_body(
         package,
         &old_version,
@@ -422,8 +402,8 @@ pub fn update_package(root: &Path, package: &str, commit: CommitOptions) -> Resu
         true,
         build_skipped,
         None,
-        nixpkgs_in,
-        nixpkgs_rv,
+        nixpkgs_input.as_deref(),
+        nixpkgs_rev.as_deref(),
     );
     tracing::info!("--- suggested PR body ---\n{body}");
 
@@ -1054,6 +1034,13 @@ fn version_gt(a: &str, b: &str) -> bool {
         }
         (a, b) => a > b,
     }
+}
+
+/// nixpkgs input name and rev for PR bodies; `None` where unknown.
+fn nixpkgs_input_info(root: &Path) -> (Option<String>, Option<String>) {
+    let (input, rev) = nix::flake_input_info(root).unwrap_or_default();
+    let non_empty = |s: String| (!s.is_empty()).then_some(s);
+    (non_empty(input), non_empty(rev))
 }
 
 fn pr_title(package: &str, old_version: &str, new_version: &str) -> String {

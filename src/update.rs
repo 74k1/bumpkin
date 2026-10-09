@@ -17,6 +17,8 @@ pub struct CommitOptions {
     pub forge: String,
     pub forge_api_url: Option<String>,
     pub no_build: Vec<String>,
+    /// Per-package branches are named `{branch_prefix}{package}`.
+    pub branch_prefix: String,
 }
 
 /// Per-machine blocklist from the BUMPKIN_SKIP env var (comma-separated).
@@ -189,7 +191,7 @@ fn commit_update_one(
         git::reset_hard(root, &format!("origin/{main_branch}"))?;
     }
 
-    let branch_name = format!("bumpkin/{package}");
+    let branch_name = format!("{}{package}", commit.branch_prefix);
     // Remove any leftover branch from a previous run.
     let _ = git::delete_branch(root, &branch_name);
     git::create_branch(root, &branch_name)?;

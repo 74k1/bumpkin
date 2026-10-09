@@ -54,14 +54,22 @@
                   services.bumpkin = {
                     enable = true;
                     maintainers = [ "74k1" ];
-                    packageSets = [ "github:74k1/tixpkgs" ];
+                    packageSets = [
+                      "github:74k1/tixpkgs"
+                      { repo = "github:74k1/tixpkgs"; path = "/var/lib/bumpkin/override"; branchPrefix = "upkeep/"; }
+                    ];
                   };
                 }
               ];
             };
           in pkgs.runCommand "bumpkin-nixos-module-eval" {
             script = nixos.config.systemd.services."bumpkin-74k1".script;
-          } "touch $out";
+          } ''
+            # Global default and per-packageSet override both reach the CLI.
+            echo "$script" | grep -qF -- "--branch-prefix bumpkin/ "
+            echo "$script" | grep -qF -- "--branch-prefix upkeep/ "
+            touch $out
+          '';
         });
 
       devShells = forAllSystems (system:

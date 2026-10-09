@@ -118,6 +118,10 @@ pub enum Command {
         /// API base URL when forge is api
         #[arg(long = "forge-api-url")]
         forge_api_url: Option<String>,
+
+        /// Prefix for per-package branch names [default: bumpkin/]
+        #[arg(long = "branch-prefix", value_name = "PREFIX")]
+        branch_prefix: Option<String>,
     },
 }
 
@@ -220,6 +224,7 @@ pub fn run(cli: Cli, c: Config) -> Result<(), String> {
             gpg_format,
             forge,
             forge_api_url,
+            branch_prefix,
         } => {
             let pkg = package.or(c.package);
             let mnt = maintainer.or(c.maintainer);
@@ -241,6 +246,9 @@ pub fn run(cli: Cli, c: Config) -> Result<(), String> {
             let gpg_format = gpg_format.or(c.gpg_format);
             let forge = forge.or(c.forge);
             let forge_api_url = forge_api_url.or(c.forge_api_url);
+            let branch_prefix = branch_prefix
+                .or(c.branch_prefix)
+                .unwrap_or_else(|| "bumpkin/".to_string());
 
             // These imply each other; catch misuse instead of silently ignoring flags.
             if push && !commit {
@@ -248,6 +256,11 @@ pub fn run(cli: Cli, c: Config) -> Result<(), String> {
             }
             if pr && !push {
                 return Err("--pr requires --push".to_string());
+            }
+            // Leftover branches are force-deleted before each run, so an empty
+            // prefix could delete an unrelated branch named like a package.
+            if branch_prefix.is_empty() {
+                return Err("--branch-prefix must not be empty".to_string());
             }
 
             if let Some(p) = pkg.as_deref() {
@@ -264,6 +277,7 @@ pub fn run(cli: Cli, c: Config) -> Result<(), String> {
                         forge: forge.unwrap_or_else(|| "auto".to_string()),
                         forge_api_url,
                         no_build,
+                        branch_prefix,
                     },
                 )
             } else if let Some(m) = mnt.as_deref() {
@@ -280,6 +294,7 @@ pub fn run(cli: Cli, c: Config) -> Result<(), String> {
                         forge: forge.unwrap_or_else(|| "auto".to_string()),
                         forge_api_url,
                         no_build,
+                        branch_prefix,
                     },
                     &skip,
                 )
@@ -354,6 +369,7 @@ mod config {
         pub forge: Option<String>,
         pub forge_api_url: Option<String>,
         pub no_build: Option<Vec<String>>,
+        pub branch_prefix: Option<String>,
         pub verbose: Option<bool>,
     }
 
@@ -447,6 +463,7 @@ in builtins.concatStringsSep "\n" [
   (line "forge_api_url" (string "forgeApiUrl"))
   (line "no_build" (list "noBuild"))
   (line "skip" (list "skip"))
+  (line "branch_prefix" (string "branchPrefix"))
   (line "verbose" (bool "verbose"))
 ]
 "#,
@@ -481,6 +498,7 @@ in builtins.concatStringsSep "\n" [
                 "skip" => {
                     config.skip = Some(value.split(",").map(|s| s.to_string()).collect());
                 }
+                "branch_prefix" => config.branch_prefix = Some(value.to_string()),
                 "verbose" => config.verbose = Some(value == "1"),
                 _ => {}
             }
@@ -517,6 +535,23 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::Update { .. }));
+    }
+
+    #[test]
+    fn cli_update_branch_prefix() {
+        let cli = Cli::try_parse_from([
+            "bumpkin",
+            "update",
+            "-p",
+            "foo",
+            "--branch-prefix",
+            "upkeep/",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Update { branch_prefix: Some(ref p), .. } if p == "upkeep/"
+        ));
     }
 
     #[test]

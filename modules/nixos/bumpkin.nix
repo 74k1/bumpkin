@@ -79,6 +79,7 @@ let
         pkgSetBlock = idx: ps:
           let
             checkout = if ps.path != null then ps.path else defaultPath ps;
+            branchPrefix = if ps.branchPrefix != null then ps.branchPrefix else cfg.branchPrefix;
           in ''
             CHECKOUT_PATH="${checkout}"
             REPO_REF="${ps.repo}"
@@ -172,6 +173,7 @@ let
               --root "$CHECKOUT_PATH" \
               --maintainer ${maintainer} \
               --forge "$FORGE" \
+              --branch-prefix ${lib.escapeShellArg branchPrefix} \
               ''${CFG_FORGE_API:+--forge-api-url "$CFG_FORGE_API"} \
               ${if cfg.actions.commit then "--commit" else ""} \
               ${if cfg.actions.signed then "--signed" else ""} \
@@ -268,6 +270,17 @@ in
       description = ''
         Package attribute paths to skip. Useful for excluding packages
         with excessively long builds (browser forks, large compilations).
+      '';
+    };
+
+    branchPrefix = mkOption {
+      type = types.strMatching ".+";
+      default = "bumpkin/";
+      example = "upkeep/";
+      description = ''
+        Prefix for per-package branch names (`<prefix><package>`).
+        No separator is added, so include a trailing `/` or `-` yourself.
+        Can be overridden per packageSet.
       '';
     };
 
@@ -381,6 +394,16 @@ in
                 - Forgejo: `https://forgejo.example.com/api/v1`
 
                 Only used when `forge` is explicitly `api`. Ignored otherwise.
+              '';
+            };
+
+            branchPrefix = mkOption {
+              type = types.nullOr (types.strMatching ".+");
+              default = null;
+              example = "upkeep/";
+              description = ''
+                Branch name prefix for this package set. If null (default),
+                `services.bumpkin.branchPrefix` is used.
               '';
             };
 

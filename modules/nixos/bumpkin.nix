@@ -11,16 +11,26 @@ let
   extractOwnerRepo = ref:
     let
       flakeMatch = builtins.match "^(github|gitlab|sourcehut):([^/]+)/([^/]+)(/.*)?$" ref;
-      sshMatch   = builtins.match "^git@[^:]+:([^/]+)/([^/]+)$" ref;
-      httpsMatch = builtins.match "^https?://[^/]+/([^/]+)/([^/]+)$" ref;
+      sshMatch    = builtins.match "^git@([^:]+):([^/]+)/([^/]+)$" ref;
+      scpMatch    = builtins.match "^[^/@]+@([^:]+):([^/]+)/([^/]+)$" ref;
+      sshUrlMatch = builtins.match "^(git\\+ssh|ssh)://[^@]+@([^/]+)/([^/]+)/([^/]+)(/.*)?$" ref;
+      httpsMatch  = builtins.match "^https?://[^/]+/([^/]+)/([^/]+)$" ref;
     in
       if flakeMatch != null then {
         owner = builtins.elemAt flakeMatch 1;
         repo  = builtins.elemAt flakeMatch 2;
       }
       else if sshMatch != null then {
-        owner = builtins.elemAt sshMatch 0;
-        repo  = stripDotGit (builtins.elemAt sshMatch 1);
+        owner = builtins.elemAt sshMatch 1;
+        repo  = stripDotGit (builtins.elemAt sshMatch 2);
+      }
+      else if scpMatch != null then {
+        owner = builtins.elemAt scpMatch 1;
+        repo  = stripDotGit (builtins.elemAt scpMatch 2);
+      }
+      else if sshUrlMatch != null then {
+        owner = builtins.elemAt sshUrlMatch 2;
+        repo  = stripDotGit (builtins.elemAt sshUrlMatch 3);
       }
       else if httpsMatch != null then {
         owner = builtins.elemAt httpsMatch 0;
@@ -95,6 +105,11 @@ let
             # maintainers share packageSets and may fire concurrently.
             (
             flock -x 9
+
+            ${lib.optionalString (ps.forgeTokenFile != null) ''
+            # Per-packageSet token overrides the global one for this set.
+            export GITHUB_TOKEN="$(cat ${ps.forgeTokenFile})"
+            ''}
 
             # Resolve clone URL via nix flake metadata.
             META_FILE="/tmp/bumpkin-meta-${toString idx}.json"
@@ -178,11 +193,16 @@ let
               ${if cfg.actions.commit then "--commit" else ""} \
               ${if cfg.actions.signed then "--signed" else ""} \
               ${if cfg.actions.push   then "--push"   else ""} \
-              ${if cfg.actions.pr     then "--pr"     else ""} \
+              ${if (if ps.pr != null then ps.pr else cfg.actions.pr) then "--pr" else ""} \
               ${if ps.noBuild != [] then "--no-build ${lib.concatStringsSep "," ps.noBuild}" else ""} \
               ${if cfg.skip != [] then "--skip ${lib.concatStringsSep "," cfg.skip}" else ""}
 
             ) 9>"$CHECKOUT_PATH.lock"
+
+            # Restore the global token after a per-packageSet override.
+            ${lib.optionalString (ps.forgeTokenFile != null && cfg.forgeTokenFile != null) ''
+            export GITHUB_TOKEN="$(cat ${cfg.forgeTokenFile})"
+            ''}
           '';
       in ''
         set -euo pipefail
@@ -341,7 +361,9 @@ in
                 - Flake refs: `github:owner/repo`, `github:owner/repo/branch`,
                   `gitlab:owner/repo`, `sourcehut:owner/repo`
                 - HTTPS: `https://github.com/owner/repo.git`
-                - SSH: `git@github.com:owner/repo.git`
+                - SSH: `git@github.com:owner/repo.git`,
+                  `user@host:owner/repo.git`,
+                  `git+ssh://user@host/owner/repo.git`
 
                 Flake refs are resolved at runtime via `nix flake metadata`.
                 Raw git URLs are used directly.
@@ -404,6 +426,26 @@ in
               description = ''
                 Branch name prefix for this package set. If null (default),
                 `services.bumpkin.branchPrefix` is used.
+              '';
+            };
+
+            pr = mkOption {
+              type = types.nullOr types.bool;
+              default = null;
+              description = ''
+                Per-packageSet override of `actions.pr`. If null (default),
+                the global `actions.pr` value is used.
+              '';
+            };
+
+            forgeTokenFile = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              description = ''
+                Token file for this package set only. Overrides the global
+                `forgeTokenFile` while this set is processed. Use this when
+                package sets live on different forges (e.g. GitHub and a
+                self-hosted Forgejo) and need different tokens.
               '';
             };
 
@@ -591,15 +633,18 @@ in
         message = "services.bumpkin.actions.pr requires actions.push to be enabled.";
       }
       {
-        assertion = cfg.actions.pr -> cfg.forgeTokenFile != null;
-        message = "services.bumpkin.forgeTokenFile must be set when actions.pr is enabled (needed for forge API).";
+        assertion = lib.all (ps:
+          (if ps.pr != null then ps.pr else cfg.actions.pr)
+          -> (ps.forgeTokenFile != null || cfg.forgeTokenFile != null)
+        ) cfg.packageSets;
+        message = "services.bumpkin.forgeTokenFile must be set (globally or per packageSet) when actions.pr is enabled (needed for forge API).";
       }
       {
         assertion = lib.all (ps: ps.forge != "api" || ps.forgeApiUrl != null) cfg.packageSets;
         message = "Each packageSet with forge = \"api\" must set forgeApiUrl.";
       }
       (let
-        paths = map (ps: ps.path or (defaultPath ps)) cfg.packageSets;
+        paths = map (ps: if ps.path != null then ps.path else defaultPath ps) cfg.packageSets;
       in {
         assertion = builtins.length paths == builtins.length (lib.unique paths);
         message = "Two packageSets resolve to the same checkout path. Set `path` explicitly on one of them.";

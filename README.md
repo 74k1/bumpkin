@@ -164,6 +164,8 @@ Use `default` unless you need a custom bumpkin derivation:
 | `packageSets.*.forgeApiUrl` | null or str | `null` | API URL for `api` forge |
 | `packageSets.*.noBuild` | list of str | `[]` | Package attr names to skip building (still update/commit/PR) |
 | `packageSets.*.branchPrefix` | null or str | `null` | Branch prefix override for this set (null = `branchPrefix`) |
+| `packageSets.*.pr` | null or bool | `null` | PR override for this set (null = `actions.pr`) |
+| `packageSets.*.forgeTokenFile` | null or str | `null` | Token file for this set (overrides `forgeTokenFile`) |
 | `branchPrefix` | str | `"bumpkin/"` | Per-package branch name prefix (`<prefix><package>`, no separator added) |
 | `actions.commit` | bool | `false` | Create per-package commits |
 | `actions.signed` | bool | `false` | GPG/SSH sign commits |
@@ -185,7 +187,8 @@ Use `default` unless you need a custom bumpkin derivation:
 
 ### Auth
 
-- `forgeTokenFile` - forge personal access token. Bumpkin uses it for forge
+- `forgeTokenFile` - forge personal access token, globally or per packageSet
+  (`packageSets.*.forgeTokenFile`). Bumpkin uses it for forge
   API calls (PR creation) and for HTTPS git transport when `git.sshKeyFile`
   is not set. It works with GitHub, Gitea, and Forgejo. The token is supplied
   through a git credential helper and a curl stdin config. It therefore never

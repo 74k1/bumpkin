@@ -85,7 +85,7 @@ then runs `bumpkin update --root <path> --maintainer <name>`.
 Options exposed to NixOS:
 - `services.bumpkin.enable`
 - `services.bumpkin.maintainers` - list of maintainer handles
-- `services.bumpkin.packageSets` - list of flake refs (string sugar) or attrsets with `repo`, `branch`, `path`, `forge`, `forgeApiUrl`, `noBuild`, `branchPrefix`
+- `services.bumpkin.packageSets` - list of flake refs (string sugar) or attrsets with `repo`, `branch`, `path`, `forge`, `forgeApiUrl`, `noBuild`, `branchPrefix`, `gitUserName`, `gitUserEmail`
 - `services.bumpkin.branchPrefix` - per-package branch prefix (default `bumpkin/`); per-packageSet `branchPrefix` overrides it
 - `services.bumpkin.actions.commit` / `.signed` / `.push` / `.pr` - batch commit/push/PR behaviour
 - `services.bumpkin.forgeTokenFile` - path to forge PAT file (GitHub, Gitea, Forgejo)

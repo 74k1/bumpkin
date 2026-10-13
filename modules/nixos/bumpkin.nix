@@ -184,6 +184,14 @@ let
             fi
 
             cd "$CHECKOUT_PATH"
+            # Per-packageSet commit identity overrides the service-level one.
+            # Set inside the flock subshell, so it cannot leak to other sets.
+            ${lib.optionalString (ps.gitUserName != null) ''
+            export GIT_AUTHOR_NAME=${lib.escapeShellArg ps.gitUserName} GIT_COMMITTER_NAME=${lib.escapeShellArg ps.gitUserName}
+            ''}
+            ${lib.optionalString (ps.gitUserEmail != null) ''
+            export GIT_AUTHOR_EMAIL=${lib.escapeShellArg ps.gitUserEmail} GIT_COMMITTER_EMAIL=${lib.escapeShellArg ps.gitUserEmail}
+            ''}
             ${bumpkinCmd} update \
               --root "$CHECKOUT_PATH" \
               --maintainer ${maintainer} \
@@ -446,6 +454,26 @@ in
                 `forgeTokenFile` while this set is processed. Use this when
                 package sets live on different forges (e.g. GitHub and a
                 self-hosted Forgejo) and need different tokens.
+              '';
+            };
+
+            gitUserName = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              example = "ed";
+              description = ''
+                Commit author/committer name for this package set. If null
+                (default), `services.bumpkin.git.userName` is used.
+              '';
+            };
+
+            gitUserEmail = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              example = "ed@example.com";
+              description = ''
+                Commit author/committer email for this package set. If null
+                (default), `services.bumpkin.git.userEmail` is used.
               '';
             };
 

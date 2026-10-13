@@ -490,6 +490,20 @@ pub fn parse_repo_url(url: &str) -> Result<(String, String, String), String> {
         return Ok((host.to_string(), owner.to_string(), repo.to_string()));
     }
 
+    // SSH URL style: ssh://[user@]host[:port]/owner/repo.git (also git+ssh://)
+    let bare = url.strip_prefix("git+").unwrap_or(url);
+    if let Some(rest) = bare.strip_prefix("ssh://") {
+        let (authority, path) = rest.split_once('/').ok_or("invalid SSH git URL")?;
+        // Drop user@ and :port; the API lives on standard ports.
+        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let host = host.split_once(':').map_or(host, |(h, _)| h);
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        let mut parts = path.splitn(2, '/');
+        let owner = parts.next().ok_or("missing owner in git URL")?;
+        let repo = parts.next().ok_or("missing repo in git URL")?;
+        return Ok((host.to_string(), owner.to_string(), repo.to_string()));
+    }
+
     // HTTPS style: https://host/owner/repo.git
     if let Some(rest) = url
         .strip_prefix("https://")
@@ -526,6 +540,24 @@ mod tests {
         assert_eq!(host, "github.com");
         assert_eq!(owner, "74k1");
         assert_eq!(repo, "tixpkgs");
+    }
+
+    #[test]
+    fn parse_repo_url_ssh_url() {
+        let (host, owner, repo) =
+            parse_repo_url("ssh://forge@git.yukume.com/74k1/tixpkgs-unfree.git").unwrap();
+        assert_eq!(host, "git.yukume.com");
+        assert_eq!(owner, "74k1");
+        assert_eq!(repo, "tixpkgs-unfree");
+    }
+
+    #[test]
+    fn parse_repo_url_git_plus_ssh_url() {
+        let (host, owner, repo) =
+            parse_repo_url("git+ssh://git@host.example.com:2222/owner/repo.git").unwrap();
+        assert_eq!(host, "host.example.com");
+        assert_eq!(owner, "owner");
+        assert_eq!(repo, "repo");
     }
 
     #[test]

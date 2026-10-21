@@ -130,6 +130,11 @@ nix flake check
   copy in the checkout's package directory (probed write access, content match), so scripts
   that write next to themselves work.
 - Per-package branches are `<branchPrefix><package>` (`--branch-prefix` / config `branchPrefix`, default `bumpkin/`). The prefix must be non-empty because leftover branches with that name are force-deleted at the start of each package.
+- updateScripts get `UPDATE_NIX_ATTR_PATH` / `UPDATE_NIX_NAME` / `UPDATE_NIX_PNAME` /
+  `UPDATE_NIX_OLD_VERSION` like nixpkgs' `update.py`. List-style `nix-update` scripts
+  (`nix-update-script`) get `--flake` injected when the repo has no root `default.nix`
+  and no `--flake`/`--file` arg is present; legacyPackages-only packages get
+  `UPDATE_NIX_ATTR_PATH=legacyPackages.<system>.<name>` in that mode.
 - A failing updateScript is reported as an error; the native updater is only used when no updateScript exists.
 - Diffs are printed only with `--verbose` (git writes them straight to stdout).
 - `update --maintainer --commit` runs per-package branches sequentially; it does not parallelize across packages (Nix builds are single-instance anyway).

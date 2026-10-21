@@ -492,6 +492,7 @@ fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
             let script = writable_script_copy(root, package, &script).unwrap_or(script);
             let status = Command::new(&script)
                 .current_dir(root)
+                .envs(nix::update_script_env(root, package))
                 .status()
                 .map_err(|e| format!("run {}: {e}", script.display()))?;
             // No native fallback here: a broken updateScript should surface,

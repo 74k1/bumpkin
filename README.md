@@ -68,6 +68,13 @@ package directory in the checkout contains a file with identical content, bumpki
 that copy instead. The checkout directory is writable. If an updateScript fails,
 bumpkin reports the error and does not fall back to the native updater.
 
+Like nixpkgs' `update.py`, bumpkin runs updateScripts with `UPDATE_NIX_ATTR_PATH`,
+`UPDATE_NIX_NAME`, `UPDATE_NIX_PNAME` and `UPDATE_NIX_OLD_VERSION` set, so
+`nix-update-script { extraArgs = [ "--subpackage=frontend" ]; }` works without an
+`attrPath`. In repos without a root `default.nix`, bumpkin adds `--flake` to
+`nix-update` calls (unless `--flake`/`--file` is already given), and points
+packages that only exist in `legacyPackages` at `legacyPackages.<system>.<name>`.
+
 **Native updater:** evaluates the package's `src` with Nix to find the upstream
 git URL, discovers new versions via `git ls-remote --tags` (works on any git
 host: GitHub, GitLab, sourcehut, Codeberg, Gitea, ...), then writes fake

@@ -32,6 +32,42 @@ pub fn package_version(root: &Path, package: &str) -> Result<String, String> {
         .map_err(|e| format!("decode package version: {e}"))
 }
 
+/// `UPDATE_NIX_*` environment for updateScripts, matching what nixpkgs'
+/// `maintainers/scripts/update.py` sets (nix-update reads the attr path from it).
+pub fn update_script_env(root: &Path, package: &str) -> Vec<(&'static str, String)> {
+    let mut env = vec![("UPDATE_NIX_ATTR_PATH", package.to_string())];
+    let out = nix_cmd()
+        .args([
+            "eval",
+            "--raw",
+            &format!("path:{}#{package}", root.display()),
+            "--apply",
+            r#"p: builtins.concatStringsSep "\t" [ (p.name or "") (p.pname or "") (p.version or "") ]"#,
+        ])
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut fields = stdout.trim_end().splitn(3, '\t');
+            for key in [
+                "UPDATE_NIX_NAME",
+                "UPDATE_NIX_PNAME",
+                "UPDATE_NIX_OLD_VERSION",
+            ] {
+                if let Some(value) = fields.next().filter(|value| !value.is_empty()) {
+                    env.push((key, value.to_string()));
+                }
+            }
+        }
+        Ok(out) => tracing::debug!(
+            "{package}: eval updateScript env failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) => tracing::debug!("{package}: eval updateScript env: {e}"),
+    }
+    env
+}
+
 pub fn build_package(root: &Path, package: &str) -> Result<bool, String> {
     git::status(nix_cmd().args([
         "build",
@@ -260,11 +296,25 @@ let
     else if builtins.isPath value then builtins.toString value
     else if builtins.isAttrs value && value ? outPath then builtins.toString value
     else throw "unsupported updateScript list element";
+  # nix-update-script defaults to `import ./. {{}}`, which only works for repos
+  # with a default.nix (like nixpkgs). Flake-only repos need `--flake`, and
+  # nix-update then resolves `packages.<system>.<attr>`, so legacy-only
+  # packages get their full attr path.
+  isNixUpdate = value: builtins.baseNameOf (scriptPart (builtins.head value)) == "nix-update";
+  hasImportFlag = value: builtins.any (arg: builtins.elem arg [ "--flake" "-F" "--file" "-f" ]) (builtins.tail value);
+  needsFlakeFlag = value:
+    isNixUpdate value && !(hasImportFlag value) && !(builtins.pathExists (flake.outPath + "/default.nix"));
+  withFlakeFlag = value:
+    if needsFlakeFlag value then [ (builtins.head value) "--flake" ] ++ builtins.tail value else value;
+  scriptPrelude = value:
+    if needsFlakeFlag value && !(flakePackages ? "{package}") then
+      "export UPDATE_NIX_ATTR_PATH=" + quote "legacyPackages.${{system}}.{package}" + "\n"
+    else "";
   normalize = value:
     if builtins.isList value then
       if value == [] then throw "empty updateScript list"
       else if wrapperPkgs != null && wrapperPkgs ? writeShellScriptBin then
-        wrapperPkgs.writeShellScriptBin "bumpkin-update-script" (builtins.concatStringsSep " " (map (part: quote (scriptPart part)) value))
+        wrapperPkgs.writeShellScriptBin "bumpkin-update-script" (scriptPrelude value + builtins.concatStringsSep " " (map (part: quote (scriptPart part)) (withFlakeFlag value)))
       else throw "updateScript is a list but no nixpkgs-like input found for writeShellScriptBin; add a nixpkgs input or legacyPackages"
     else value;
 in normalize script

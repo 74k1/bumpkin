@@ -39,24 +39,21 @@ nix develop -c cargo build --release
 # Discover packages
 bumpkin list --maintainer 74k1 --root $HOME/dev/tixpkgs
 
-# Dry-run (temp worktree, no mutation; same as `update --maintainer` without --commit)
-bumpkin dry-run --package arcbrush --root $HOME/dev/tixpkgs
-bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs
+# Dry run for a maintainer (temp worktrees, checkout untouched; -v shows diffs)
+bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs
 
-# Update one package (local, no commit)
+# Update one package in place (no commit), build it, print the PR text
 bumpkin update --package arcbrush --root $HOME/dev/tixpkgs
 
-# Update one package: dedicated branch, commit, push, PR
+# One package or a whole maintainer: per-package branch, commit, push, PR
 bumpkin update --package arcbrush --root $HOME/dev/tixpkgs --commit --signed --push --pr
-
-# Batch maintainer: per-package branches, commit, push, PR
 bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --signed --push --pr
 
 # Custom branch names (default prefix: bumpkin/ -> bumpkin/<package>)
 bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --branch-prefix "upkeep/"
 
-# Per-machine blocklist (works for dry-run and update)
-BUMPKIN_SKIP=waterfox,waterfox-unwrapped bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs
+# Skip packages entirely (flag or per-machine env var), or skip only their build
+BUMPKIN_SKIP=waterfox,waterfox-unwrapped bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs
 bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build waterfox,waterfox-unwrapped
 
 # Skip all builds (bare --no-build)
@@ -88,11 +85,11 @@ or bare `rev = version;`). `rev`/`tag`/`url` and the src hash are read from
 the `src = fetcher { ... }` attrset first, so patch URLs and hashes elsewhere in
 the file are left alone. The package file is located via `meta.position`.
 
-**Forge backends:** `auto` (for github.com the `gh` CLI if it is installed, otherwise the REST API of the `origin` host: GitHub, or Gitea/Forgejo at `https://<host>/api/v1`), `github-cli`, `github-api`, `api`. Per-package branches are force-pushed, so an open PR is updated in place instead of duplicated.
+**Forge backends:** `auto` (for github.com the `gh` CLI if it is installed, otherwise the REST API of the `origin` host: GitHub, or Gitea/Forgejo at `https://<host>/api/v1`), `gh`, `api`. Per-package branches are force-pushed unless the remote already has the same content, so an open PR is updated in place instead of duplicated.
 
 **Dependency hash refresh:** `cargoHash`, `vendorHash`, `npmDepsHash`, `yarnHash`, `pomHash`, `mvnHash`, `mixHash`, `nugetHash`, `dotnetHash`.
 
-**PR body:** version change, build status, a check whether a built binary prints the new version (`--version`, `-V`, `--help`, run inside the Nix sandbox), an upstream compare link where one can be derived, and the nixpkgs revision.
+**PR body:** version change, build status, a check whether a built binary prints the new version (`--version`, `-V`, `--help`, run inside the Nix sandbox), upstream compare link, `meta.changelog`, `meta.homepage`, other packages of the flake that are rebuilt by the change, the revision of the `nixpkgs` input, and a closure diff against the previous build when that is still in the store. An update that would lower a numeric version is refused.
 
 ## CI
 

@@ -1,4 +1,4 @@
-// Logs go to stderr; stdout is reserved for data (`list`, `list --json`).
+// Logs go to stderr; stdout is reserved for data (`list`).
 macro_rules! log {
     ($level:literal, $($arg:tt)*) => { eprintln!("{:>5} {}", $level, format!($($arg)*)) };
 }
@@ -30,25 +30,24 @@ Usage: bumpkin [OPTIONS] <COMMAND>
 
 Commands:
   list               List packages maintained by --maintainer
-  dry-run            Update + build in a temp worktree; the checkout is not touched
-  run-update-script  Run the updater for --package and exit
-  update             Update --package (in place) or all packages of --maintainer
+  update             Update --package or all packages of --maintainer. Without
+                     --commit: --package edits the checkout in place,
+                     --maintainer is a dry run in temp worktrees
 
 Options:
   -C, --root <PATH>          Root of the flake repository [default: .]
   -p, --package <ATTR>       Single package
   -m, --maintainer <NAME>    Maintainer handle
   -v, --verbose              Show internal steps and diffs
-      --json                 list: output JSON
       --skip <A,B>           Packages to skip (also: BUMPKIN_SKIP env var)
       --no-build [<A,B>]     Packages to update without building (no value: all)
-      --commit               Commit (batch mode: on per-package branches)
+      --commit               Commit each update on its own branch
       --signed               Sign commits (git commit -S)
       --push                 Push per-package branches to origin (needs --commit)
       --pr                   Open pull requests (needs --push)
       --signing-key <KEY>    Git user.signingkey for the commit
       --gpg-format <FORMAT>  Git gpg.format for the commit (openpgp or ssh)
-      --forge <FORGE>        auto, github-cli, github-api, or api [default: auto]
+      --forge <FORGE>        auto, gh, or api [default: auto]
       --forge-api-url <URL>  REST API base URL (default: derived from origin)
       --branch-prefix <P>    Per-package branch prefix [default: bumpkin/]
   -h, --help                 Print help
@@ -59,7 +58,6 @@ pub struct Args {
     pub command: String,
     pub root: PathBuf,
     pub verbose: bool,
-    pub json: bool,
     pub package: Option<String>,
     pub maintainer: Option<String>,
     pub commit: bool,
@@ -98,7 +96,6 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             "-p" | "--package" => a.package = Some(value()?),
             "-m" | "--maintainer" => a.maintainer = Some(value()?),
             "-v" | "--verbose" => a.verbose = true,
-            "--json" => a.json = true,
             "--skip" => a.skip = list(value()?),
             "--no-build" => a.no_build = list(optional().unwrap_or("*".into())),
             "--commit" => a.commit = true,
@@ -134,42 +131,15 @@ pub fn run(mut a: Args) -> Result<(), String> {
     match a.command.as_str() {
         "list" => {
             let maintainer = a.maintainer.ok_or("list needs --maintainer <name>")?;
-            let packages = nix::packages_by_maintainer(&a.root, &maintainer)?;
-            let rows: Vec<_> = packages
-                .iter()
-                .map(|p| {
-                    let backend = if p.has_update_script { "update-script" } else { "native" };
-                    (&p.attr_path, backend, p.file.as_ref().map(|f| f.display().to_string()))
-                })
-                .collect();
-            if a.json {
-                let objects: Vec<_> = rows
-                    .iter()
-                    .map(|(attr, backend, file)| {
-                        let file = file
-                            .as_deref()
-                            .map_or("null".to_string(), |f| format!("\"{}\"", json_escape(f)));
-                        format!(
-                            "  {{\"attr_path\":\"{}\",\"backend\":\"{backend}\",\"file\":{file}}}",
-                            json_escape(attr)
-                        )
-                    })
-                    .collect();
-                println!("[\n{}\n]", objects.join(",\n"));
-            } else {
-                for (attr, backend, file) in rows {
-                    println!("{attr}\t{backend}\t{}", file.as_deref().unwrap_or("unknown"));
-                }
+            for p in nix::packages_by_maintainer(&a.root, &maintainer)? {
+                let backend = if p.has_update_script { "update-script" } else { "native" };
+                let file = p.file.map_or("unknown".to_string(), |f| f.display().to_string());
+                println!("{}\t{backend}\t{file}", p.attr_path);
             }
             Ok(())
         }
 
-        "run-update-script" => {
-            let package = a.package.ok_or("run-update-script needs --package <attr>")?;
-            update::run_update_script(&a.root, &package)
-        }
-
-        "dry-run" | "update" => {
+        "update" => {
             // These imply each other; catch misuse instead of silently ignoring flags.
             if a.push && !a.commit {
                 return Err("--push requires --commit".to_string());
@@ -182,44 +152,18 @@ pub fn run(mut a: Args) -> Result<(), String> {
             if a.branch_prefix.is_empty() {
                 return Err("--branch-prefix must not be empty".to_string());
             }
-            let dry = a.command == "dry-run";
-            if dry && a.commit {
-                return Err("dry-run does not take --commit".to_string());
-            }
-
             if let Some(package) = a.package.as_deref() {
-                if dry {
-                    update::dry_run_package(&a.root, package)
-                } else {
-                    update::update_package(&a.root, package, &a)
-                }
+                update::update_package(&a.root, package, &a)
             } else if let Some(maintainer) = a.maintainer.as_deref() {
-                // Without --commit this runs in temp worktrees, i.e. a dry run.
                 update::update_maintainer(&a.root, maintainer, &a)
             } else {
-                Err(format!("{} needs --package <attr> or --maintainer <name>", a.command))
+                Err("update needs --package <attr> or --maintainer <name>".to_string())
             }
         }
 
         "" => Err("missing command (see --help)".to_string()),
         other => Err(format!("unknown command `{other}` (see --help)")),
     }
-}
-
-pub(crate) fn json_escape(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -232,8 +176,8 @@ mod tests {
 
     #[test]
     fn parses_commands_and_flags() {
-        let a = parse_ok(&["-C", "/tmp/flake", "-v", "list", "-m", "x", "--json"]);
-        assert_eq!((a.command.as_str(), a.verbose, a.json), ("list", true, true));
+        let a = parse_ok(&["-C", "/tmp/flake", "-v", "list", "-m", "x"]);
+        assert_eq!((a.command.as_str(), a.verbose), ("list", true));
         assert_eq!(a.root, PathBuf::from("/tmp/flake"));
         assert_eq!(a.maintainer.as_deref(), Some("x"));
 

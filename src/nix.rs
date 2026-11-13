@@ -25,6 +25,10 @@ pub struct PackageInfo {
     pub name: String,
     pub pname: String,
     pub version: String,
+    /// Output store path (it need not exist yet).
+    pub out_path: String,
+    pub changelog: String,
+    pub homepage: String,
     /// `src.gitRepoUrl` (set by fetchFromGitHub and friends), if any.
     pub git_repo_url: String,
     /// `src.urls` (or `[src.url]`) of the source derivation.
@@ -63,14 +67,59 @@ fn checkout_file(root: &Path, position: &str) -> Option<PathBuf> {
     file.exists().then_some(file)
 }
 
-pub fn package_version(root: &Path, package: &str) -> String {
-    let out = nix_cmd()
-        .args(["eval", "--raw", &format!("{}.version", installable(root, package))])
-        .output();
-    match out {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => "unknown".to_string(),
+/// `nix store diff-closures` between two built outputs; "" if unavailable.
+pub fn closure_diff(old: &str, new: &str) -> String {
+    let out = nix_cmd().args(["store", "diff-closures", old, new]).output();
+    let text = out.map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+    strip_ansi(&text.unwrap_or_default())
+}
+
+/// Drop `ESC [ ... m` colour sequences (Nix emits them even when piped).
+fn strip_ansi(text: &str) -> String {
+    let mut parts = text.split("\x1b[");
+    let mut out = parts.next().unwrap_or_default().to_string();
+    for part in parts {
+        out.push_str(part.split_once('m').map_or(part, |(_, rest)| rest));
     }
+    out
+}
+
+#[test]
+fn strip_ansi_removes_colour_codes() {
+    assert_eq!(strip_ansi("a: \x1b[31;1m1 KiB\x1b[0m\nb"), "a: 1 KiB\nb");
+}
+
+/// Other `packages.<system>` outputs whose build closure contains `package`,
+/// i.e. that are rebuilt by its update. Empty for legacyPackages-only sets.
+pub fn dependents(root: &Path, package: &str) -> Vec<String> {
+    let drvs = flake_ref(root).and_then(|flake| eval(&drv_paths_expr(&flake))).unwrap_or_default();
+    let drvs: Vec<(&str, &str)> = drvs.lines().filter_map(|line| line.split_once('\t')).collect();
+    let Some((_, target)) = drvs.iter().find(|(name, _)| *name == package) else {
+        return Vec::new();
+    };
+    let closure = Command::new("nix-store")
+        .args(["--query", "--referrers-closure", target])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    drvs.iter()
+        .filter(|(name, drv)| *name != package && closure.lines().any(|line| line == *drv))
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
+fn drv_paths_expr(flake_ref: &str) -> String {
+    format!(
+        r#"
+let
+  flake = builtins.getFlake "{flake_ref}";
+  {PRELUDE}
+  line = name:
+    let r = builtins.tryEval flakePackages.${{name}}.drvPath;
+    in if r.success then name + "\t" + r.value else "";
+in builtins.concatStringsSep "\n" (map line (builtins.attrNames flakePackages))
+"#
+    )
 }
 
 pub fn build_package(root: &Path, package: &str) -> Result<bool, String> {
@@ -91,16 +140,14 @@ pub fn build_package_with_log(root: &Path, package: &str) -> Result<(bool, Strin
     Ok((out.status.success(), String::from_utf8_lossy(&log).into_owned()))
 }
 
-/// nixpkgs input name and rev for PR bodies; empty strings where unknown.
-pub fn flake_input_info(root: &Path) -> (String, String) {
-    let stdout = flake_ref(root)
-        .and_then(|flake| eval(&flake_input_info_expr(&flake)))
-        .unwrap_or_default();
-    let field = |key: &str| {
-        let value = stdout.lines().find_map(|line| line.strip_prefix(key));
-        value.unwrap_or_default().to_string()
-    };
-    (field("input\t"), field("rev\t"))
+/// Locked rev of the flake's `nixpkgs` input for PR bodies ("" if there is
+/// none); evaluated once per run.
+pub fn nixpkgs_rev(root: &Path) -> &'static str {
+    static REV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REV.get_or_init(|| {
+        let expr = |flake| format!(r#"(builtins.getFlake "{flake}").inputs.nixpkgs.rev or """#);
+        flake_ref(root).and_then(|flake| eval(&expr(flake))).unwrap_or_default()
+    })
 }
 
 pub fn package_info(root: &Path, package: &str) -> Result<PackageInfo, String> {
@@ -113,6 +160,9 @@ pub fn package_info(root: &Path, package: &str) -> Result<PackageInfo, String> {
             "name" => info.name = value.to_string(),
             "pname" => info.pname = value.to_string(),
             "version" => info.version = value.to_string(),
+            "out" => info.out_path = value.to_string(),
+            "changelog" => info.changelog = value.to_string(),
+            "homepage" => info.homepage = value.to_string(),
             "gitRepoUrl" => info.git_repo_url = value.to_string(),
             "url" if !value.is_empty() => info.urls.push(value.to_string()),
             _ => {}
@@ -238,6 +288,9 @@ in builtins.concatStringsSep "\n" ([
   ("name\t" + str (package.name or ""))
   ("pname\t" + str (package.pname or ""))
   ("version\t" + str (package.version or ""))
+  ("out\t" + str (package.outPath or ""))
+  ("changelog\t" + str (package.meta.changelog or ""))
+  ("homepage\t" + str (package.meta.homepage or ""))
   ("gitRepoUrl\t" + (if src == null then "" else str (src.gitRepoUrl or "")))
 ] ++ map (u: "url\t" + u) urls)
 "#,
@@ -250,9 +303,7 @@ fn update_script_expr(flake_ref: &str, package: &str) -> String {
         r#"
 let
   flake = builtins.getFlake "{flake_ref}";
-  system = builtins.currentSystem;
-  flakePackages = flake.packages.${{system}} or {{}};
-  legacyPackages = flake.legacyPackages.${{system}} or {{}};
+  {PRELUDE}
   inputNames = builtins.attrNames (flake.inputs or {{}});
   wrapperPkgs =
     if legacyPackages ? writeShellScriptBin then legacyPackages
@@ -360,23 +411,6 @@ let
 in builtins.concatStringsSep "\n" (map lineFor matchingNames)
 "#,
         maintainer = escape_nix_string(maintainer)
-    )
-}
-
-fn flake_input_info_expr(flake_ref: &str) -> String {
-    format!(
-        r#"
-let
-  flake = builtins.getFlake "{flake_ref}";
-  inputNames = builtins.attrNames (flake.inputs or {{}});
-  nixpkgsName = builtins.head (
-    builtins.filter (name:
-      let input = flake.inputs.${{name}} or {{}};
-      in input ? rev && input ? outPath && (import input {{ system = builtins.currentSystem; }}).stdenv or null != null
-    ) inputNames
-  );
-in "input\t" + nixpkgsName + "\nrev\t" + (flake.inputs.${{nixpkgsName}}.rev or "")
-"#
     )
 }
 

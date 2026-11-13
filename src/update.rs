@@ -74,11 +74,6 @@ fn commit(root: &Path, paths: &[String], title: &str, body: &str, a: &Args) -> R
     git::commit_paths(root, paths, title, body, a.signed, &config)
 }
 
-pub fn dry_run_package(root: &Path, package: &str) -> Result<(), String> {
-    log_outcome(package, worktree_update_one(root, package)?);
-    Ok(())
-}
-
 pub fn update_maintainer(root: &Path, maintainer: &str, a: &Args) -> Result<(), String> {
     let main_branch = git::current_branch(root)?;
     if a.commit {
@@ -167,8 +162,8 @@ fn commit_update_one(
     let _ = git::delete_branch(root, &branch);
     git::create_branch(root, &branch)?;
 
-    let old_version = nix::package_version(root, package);
-    run_update_script(root, package)?;
+    let before = nix::package_info(root, package)?;
+    run_update_script(root, package, &before)?;
 
     let changed_paths = git::changed_paths(root)?;
     if changed_paths.is_empty() {
@@ -176,8 +171,8 @@ fn commit_update_one(
         let _ = git::delete_branch(root, &branch);
         return Ok(NO_CHANGES);
     }
-    let new_version = nix::package_version(root, package);
-    let title = pr_title(package, &old_version, &new_version);
+    let after = updated_info(root, package, &before)?;
+    let title = pr_title(package, &before, &after);
     if crate::verbose() {
         git::print_diff_stat(root)?;
     }
@@ -189,7 +184,7 @@ fn commit_update_one(
         let (ok, log) = nix::build_package_with_log(root, package)?;
         (Some(ok), log)
     };
-    let body = pr_body(root, package, &old_version, &new_version, build_ok, &build_log);
+    let body = pr_body(root, package, &before, &after, build_ok, &build_log);
     commit(root, &changed_paths, &title, &body, a)?;
 
     // Skip the force-push when the remote branch already has this exact
@@ -208,20 +203,21 @@ fn commit_update_one(
         match pr {
             Ok(url) => info!("{package}: PR created: {url}"),
             Err(err) if err.contains("already exists") => {
-                info!("{package}: PR already exists, branch updated")
+                info!("{package}: PR already exists, branch is up to date")
             }
             Err(err) => warn!("{package}: PR creation failed: {err}"),
         }
     }
 
     // Return to main. Only drop the per-package branch once its commit is
-    // durably stored on the remote; on push failure (or when --push was not
-    // requested) keep the branch so the commit survives for inspection/retry.
+    // durably stored on the remote; otherwise keep it so the commit survives.
     git::checkout_branch(root, main_branch)?;
     if pushed {
         let _ = git::delete_branch(root, &branch);
-    } else {
+    } else if a.push {
         warn!("{package}: keeping branch {branch} (commit not on remote)");
+    } else {
+        info!("{package}: committed on branch {branch}");
     }
     Ok(if build_ok == Some(false) { BUILD_FAILED } else { BUILD_OK })
 }
@@ -229,7 +225,8 @@ fn commit_update_one(
 /// Update and build in a temp worktree, leaving the checkout untouched.
 fn worktree_update_one(root: &Path, package: &str) -> Result<&'static str, String> {
     let worktree = TempWorktree::create(root)?;
-    run_update_script(worktree.path(), package)?;
+    let info = nix::package_info(worktree.path(), package)?;
+    run_update_script(worktree.path(), package, &info)?;
     if git::clean(worktree.path())? {
         return Ok(NO_CHANGES);
     }
@@ -242,12 +239,12 @@ fn worktree_update_one(root: &Path, package: &str) -> Result<&'static str, Strin
     Ok(if built { BUILD_OK } else { BUILD_FAILED })
 }
 
+/// Single package: with `--commit` the per-package branch flow (same as batch
+/// mode); without it, update in place and print the PR text.
 pub fn update_package(root: &Path, package: &str, a: &Args) -> Result<(), String> {
     ensure_clean(root)?;
 
-    if a.push {
-        // Per-package branch flow, same as batch mode: branch -> update ->
-        // build -> commit -> push -> PR -> return to the current branch.
+    if a.commit {
         let main_branch = git::current_branch(root)?;
         ensure_on_branch(&main_branch)?;
         let result = commit_update_one(root, &main_branch, package, a);
@@ -256,18 +253,14 @@ pub fn update_package(root: &Path, package: &str, a: &Args) -> Result<(), String
         return Ok(());
     }
 
-    let old_version = nix::package_version(root, package);
-    run_update_script(root, package)?;
-
-    let changed_paths = git::changed_paths(root)?;
-    if changed_paths.is_empty() {
-        info!("No diff after running update script.");
+    let before = nix::package_info(root, package)?;
+    run_update_script(root, package, &before)?;
+    if git::clean(root)? {
+        info!("{package}: {NO_CHANGES}");
         return Ok(());
     }
-
-    let new_version = nix::package_version(root, package);
-    let title = pr_title(package, &old_version, &new_version);
-    info!("--- suggested PR title ---\n{title}");
+    let after = updated_info(root, package, &before)?;
+    info!("--- suggested PR title ---\n{}", pr_title(package, &before, &after));
     git::print_diff_stat(root)?;
 
     let build_ok = if skip_build(a, package) {
@@ -278,17 +271,8 @@ pub fn update_package(root: &Path, package: &str, a: &Args) -> Result<(), String
     } else {
         return Err("build failed; leaving changes in working tree".to_string());
     };
-    let body = pr_body(root, package, &old_version, &new_version, build_ok, "");
-    info!("--- suggested PR body ---\n{body}");
-
-    if a.commit {
-        commit(root, &changed_paths, &title, &body, a)?;
-        info!("Committed{}: {title}", if a.signed { " signed" } else { "" });
-    } else {
-        info!(
-            "No commit created. Re-run with --commit to commit, or --commit --signed for a signed commit."
-        );
-    }
+    info!("--- suggested PR body ---\n{}", pr_body(root, package, &before, &after, build_ok, ""));
+    info!("Changes left in the working tree. Re-run with --commit for a commit on a branch.");
     Ok(())
 }
 
@@ -325,8 +309,7 @@ fn writable_script_copy(package_file: Option<&Path>, store_script: &Path) -> Opt
 }
 
 /// Run the package's updateScript, or the native updater when it has none.
-pub fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
-    let info = nix::package_info(root, package)?;
+fn run_update_script(root: &Path, package: &str, info: &nix::PackageInfo) -> Result<(), String> {
     debug!("{package}: trying updateScript...");
     match nix::build_update_script(root, package) {
         Ok(script_out) => {
@@ -358,7 +341,7 @@ pub fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
         }
         Err(err) => {
             debug!("{package}: no runnable updateScript:\n{err}");
-            native_fetcher_update(root, package, &info)
+            native_fetcher_update(root, package, info)
         }
     }
 }
@@ -748,12 +731,26 @@ fn version_gt(a: &str, b: &str) -> bool {
     }
 }
 
+/// Package info after an update; refuses numeric downgrades (a misbehaving updateScript).
+fn updated_info(
+    root: &Path,
+    package: &str,
+    before: &nix::PackageInfo,
+) -> Result<nix::PackageInfo, String> {
+    let after = nix::package_info(root, package)?;
+    let (old, new) = (&before.version, &after.version);
+    if parse_version(old).is_some() && parse_version(new).is_some() && version_gt(old, new) {
+        return Err(format!("update would downgrade {old} -> {new}; refusing"));
+    }
+    Ok(after)
+}
+
 /// Best-effort upstream compare link between the old and new version tags.
-fn compare_url(root: &Path, package: &str, old: &str, new: &str) -> Option<String> {
-    let info = nix::package_info(root, package).ok()?;
-    let text = fs::read_to_string(info.file?).ok()?;
-    let prefix = version_linked_prefix(src_scope(&text), new)?;
-    compare_link(&git_url_from_src(&info.git_repo_url, &info.urls)?, &prefix, old, new)
+fn compare_url(info: &nix::PackageInfo, old: &str) -> Option<String> {
+    let text = fs::read_to_string(info.file.as_ref()?).ok()?;
+    let prefix = version_linked_prefix(src_scope(&text), &info.version)?;
+    let git_url = git_url_from_src(&info.git_repo_url, &info.urls)?;
+    compare_link(&git_url, &prefix, old, &info.version)
 }
 
 fn compare_link(git_url: &str, prefix: &str, old: &str, new: &str) -> Option<String> {
@@ -766,16 +763,20 @@ fn compare_link(git_url: &str, prefix: &str, old: &str, new: &str) -> Option<Str
     Some(format!("{repo}{path}{prefix}{old}...{prefix}{new}"))
 }
 
-fn pr_title(package: &str, old_version: &str, new_version: &str) -> String {
-    format!("feat({package}): {old_version} -> {new_version}")
+fn shown(version: &str) -> &str {
+    if version.is_empty() { "unknown" } else { version }
+}
+
+fn pr_title(package: &str, before: &nix::PackageInfo, after: &nix::PackageInfo) -> String {
+    format!("feat({package}): {} -> {}", shown(&before.version), shown(&after.version))
 }
 
 /// `build_ok` is `None` when the build was skipped (no-build list).
 fn pr_body(
     root: &Path,
     package: &str,
-    old_version: &str,
-    new_version: &str,
+    before: &nix::PackageInfo,
+    after: &nix::PackageInfo,
     build_ok: Option<bool>,
     build_log: &str,
 ) -> String {
@@ -785,33 +786,49 @@ fn pr_body(
         Some(false) => (" ", " failed ⚠️"),
         None => (" ", " skipped ⏩ (in no-build list)"),
     };
+    let (old, new) = (shown(&before.version), shown(&after.version));
     let mut body = format!(
-        "Update `{package}` from `{old_version}` to `{new_version}`.\n\n\
+        "Update `{package}` from `{old}` to `{new}`.\n\n\
          **Built on platform:**\n\n- [{check}] `{}-{os}`{note}\n\n",
         env::consts::ARCH
     );
     if build_ok == Some(true) {
         body.push_str(&match nix::version_check(root, package) {
-            Some(command) => format!("- [x] `{command}` prints `{new_version}`\n\n"),
+            Some(command) => format!("- [x] `{command}` prints `{new}`\n\n"),
             None => "- [ ] no binary printed the version (`--version`, `-V`, `--help`)\n\n".into(),
         });
     }
-    if let Some(url) = compare_url(root, package, old_version, new_version) {
-        body.push_str(&format!("**Changes:** {url}\n\n"));
-    }
-    let (input, rev) = nix::flake_input_info(root);
-    if !input.is_empty() && !rev.is_empty() {
-        body.push_str(&format!("**Flake:** `{input}` at `{rev}`\n\n"));
-    } else if !input.is_empty() {
-        body.push_str(&format!("**Flake:** `{input}`\n\n"));
+
+    let code = |text: &str| if text.is_empty() { String::new() } else { format!("`{text}`") };
+    let rebuilds: Vec<String> = nix::dependents(root, package).iter().map(|n| code(n)).collect();
+    for (label, value) in [
+        ("Changes", compare_url(after, &before.version).unwrap_or_default()),
+        ("Changelog", after.changelog.clone()),
+        ("Homepage", after.homepage.clone()),
+        ("Also rebuilds", rebuilds.join(", ")),
+        ("nixpkgs", code(nix::nixpkgs_rev(root))),
+    ] {
+        if !value.is_empty() {
+            body.push_str(&format!("**{label}:** {value}\n\n"));
+        }
     }
     body.push_str("Generated by [bumpkin](https://github.com/74k1/bumpkin).");
+
+    let mut details = |summary: &str, text: &str| {
+        if !text.is_empty() {
+            body.push_str(&format!(
+                "\n\n<details>\n<summary>{summary}</summary>\n\n```\n{text}\n```\n</details>\n"
+            ));
+        }
+    };
+    // Only when the pre-update build is still in the store; never built for this.
+    let old_out = Path::new(&before.out_path);
+    if build_ok == Some(true) && old_out.is_absolute() && old_out.exists() {
+        details("Closure diff", &nix::closure_diff(&before.out_path, &after.out_path));
+    }
     if build_ok == Some(false) {
         let lines: Vec<&str> = build_log.lines().collect();
-        let tail = lines[lines.len().saturating_sub(20)..].join("\n");
-        body.push_str(&format!(
-            "\n\n<details>\n<summary>Build log (last 20 lines)</summary>\n\n```\n{tail}\n```\n</details>\n"
-        ));
+        details("Build log (last 20 lines)", &lines[lines.len().saturating_sub(20)..].join("\n"));
     }
     body
 }

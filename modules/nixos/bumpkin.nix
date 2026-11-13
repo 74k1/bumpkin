@@ -142,11 +142,6 @@ let
             ${bumpkinCmd} update ${lib.escapeShellArgs args} --root "$CHECKOUT_PATH"
 
             ) 9>"$CHECKOUT_PATH.lock"
-
-            # Restore the global token after a per-packageSet override.
-            ${lib.optionalString (ps.forgeTokenFile != null && cfg.forgeTokenFile != null) ''
-            export GITHUB_TOKEN="$(cat ${cfg.forgeTokenFile})"
-            ''}
           '';
       in ''
         set -euo pipefail
@@ -334,15 +329,14 @@ in
             };
 
             forge = mkOption {
-              type = types.nullOr (types.enum [ "auto" "github-cli" "github-api" "api" ]);
+              type = types.nullOr (types.enum [ "auto" "gh" "api" ]);
               default = null;
               description = ''
                 Forge backend for PR creation.
 
                 - `auto`: `gh` CLI for github.com if available, else the REST API
-                - `github-cli`: always use `gh` CLI
-                - `github-api`: use GitHub REST API via curl
-                - `api`: use a GitHub-compatible REST API via curl (Gitea, Forgejo)
+                - `gh`: always use the `gh` CLI
+                - `api`: always use the REST API via curl (GitHub, Gitea, Forgejo)
 
                 If null (default), `auto` is used: `gh` for github.com,
                 otherwise the REST API of the repo's host.

@@ -12,8 +12,8 @@ pub enum Forge {
     Api { token: String, pulls_url: String },
 }
 
-/// Pick the backend from `--forge` and the `origin` URL. `auto` uses `gh` for
-/// github.com when installed, otherwise the REST API of the remote's host.
+/// Pick the backend from `--forge` (auto, gh, api) and the `origin` URL.
+/// `auto` uses `gh` for github.com when installed, otherwise the REST API.
 pub fn resolve(
     mode: &str,
     api_url: Option<&str>,
@@ -23,14 +23,10 @@ pub fn resolve(
     let (host, owner, repo) = parse_repo_url(repo_url)?;
     let github = host == "github.com";
     let gh = match mode {
-        "github-cli" => true,
+        "gh" => true,
         "auto" => github && Command::new("gh").arg("--version").output().is_ok(),
-        "github-api" | "api" => false,
-        other => {
-            return Err(format!(
-                "unknown forge: {other} (expected auto, github-cli, github-api, or api)"
-            ));
-        }
+        "api" => false,
+        other => return Err(format!("unknown forge: {other} (expected auto, gh, or api)")),
     };
     if gh {
         return Ok(Forge::Gh);
@@ -39,10 +35,10 @@ pub fn resolve(
         "the forge REST API needs a token (set GITHUB_TOKEN, or forgeTokenFile in the NixOS module)",
     )?;
     let api_base = match api_url {
-        Some(url) if mode != "github-api" => url.trim_end_matches('/').to_string(),
-        _ if github || mode == "github-api" => "https://api.github.com".to_string(),
+        Some(url) => url.trim_end_matches('/').to_string(),
+        None if github => "https://api.github.com".to_string(),
         // Assume a Gitea/Forgejo-style self-hosted instance.
-        _ => format!("https://{host}/api/v1"),
+        None => format!("https://{host}/api/v1"),
     };
     Ok(Forge::Api {
         token: token.to_string(),
@@ -76,13 +72,12 @@ impl Forge {
                 }
             }
             Forge::Api { token, pulls_url } => {
-                let esc = crate::json_escape;
                 let json = format!(
                     r#"{{"title":"{}","head":"{}","base":"{}","body":"{}"}}"#,
-                    esc(title),
-                    esc(head),
-                    esc(base),
-                    esc(body),
+                    json_escape(title),
+                    json_escape(head),
+                    json_escape(base),
+                    json_escape(body),
                 );
                 let response = curl_post(pulls_url, token, &json)?;
                 pr_url(&response).ok_or(response)
@@ -112,6 +107,22 @@ fn curl_post(url: &str, token: &str, body: &str) -> Result<String, String> {
         .map_err(|e| format!("write curl config: {e}"))?;
     let out = child.wait_with_output().map_err(|e| format!("curl {url}: {e}"))?;
     Ok(String::from_utf8_lossy(&[out.stdout, out.stderr].concat()).into_owned())
+}
+
+fn json_escape(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out
 }
 
 /// The PR's `html_url` in a create-PR response. Nested objects (`user`,
@@ -171,7 +182,7 @@ mod tests {
             _ => panic!("expected API backend"),
         };
         assert_eq!(
-            pulls("github-api", None, "git@github.com:o/r.git"),
+            pulls("api", None, "git@github.com:o/r.git"),
             "https://api.github.com/repos/o/r/pulls"
         );
         assert_eq!(

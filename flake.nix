@@ -14,7 +14,7 @@
         bumpkin = import ./modules/nixos/bumpkin.nix;
         default = { config, lib, pkgs, ... }: {
           imports = [ self.nixosModules.bumpkin ];
-          config.services.bumpkin.package = lib.mkDefault self.packages.${pkgs.system}.default;
+          config.services.bumpkin.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
       };
 

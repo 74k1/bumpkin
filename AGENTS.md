@@ -21,11 +21,11 @@ Bumpkin is a Rust/Nix flake upkeep bot. It should work for arbitrary flake packa
 - Do not add `unsafe` unless there is a very strong reason.
 - Prefer package-owned `passthru.updateScript` / `updateScript` over bot-side upstream heuristics.
 - Do not brute-force upstream version URLs.
-- Default local CLI flow should update/build/print PR text without committing or opening PRs.
+- Without `--commit`, `update --package` edits the checkout in place, builds and prints the PR text; nothing is committed or pushed.
 - Signed commits should use Git's normal signing machinery (`git commit -S`) rather than custom crypto.
 - Keep state in logs/PRs; avoid adding a database unless explicitly requested.
-- Dry-run commands must not mutate repositories.
-- Batch `update --maintainer` supports `--commit` / `--signed` / `--push` (per-package branches). Without these flags it uses temp worktrees and does not mutate the checkout.
+- `update --maintainer` without `--commit` is the dry run: temp worktrees, the checkout is not mutated.
+- `--commit` always means the per-package branch flow (`<branchPrefix><package>`), for one package or a whole maintainer; `--push` and `--pr` build on it.
 
 ## Update priority order
 
@@ -53,12 +53,10 @@ Bumpkin is a Rust/Nix flake upkeep bot. It should work for arbitrary flake packa
 src/
   main.rs        # Parse args, run, error exit
   lib.rs         # Log macros, hand-rolled CLI parser (Args, --help), command dispatch
-  update.rs      # Update logic: per-package update, batch maintainer update, temp-worktree
-                 #   dry run, native updater (git ls-remote tags + Nix-computed hashes),
-                 #   fake-hash refresh loop (src + cargoHash, vendorHash, npmDepsHash, etc.)
-  nix.rs         # Nix evaluation: maintainer query, package info (file via meta.position,
-                 #   name/version, src gitRepoUrl/urls), build, updateScript,
-                 #   flake input info (nixpkgs rev for PR bodies)
+  update.rs      # Update flows (in place, temp worktree, per-package branch), PR text,
+                 #   native updater (git ls-remote tags + Nix-computed hashes)
+  nix.rs         # Everything that calls nix: maintainer query, package info, builds,
+                 #   updateScript, version check, dependents, closure diff
   git.rs         # Git helpers: branch, commit, push, diff, remote_url
   forge.rs       # PR creation via gh CLI or curl against the GitHub / Gitea / Forgejo REST API
 modules/nixos/
@@ -70,84 +68,63 @@ modules/nixos/
 None. Keep it that way unless there is a very strong reason.
 
 - CLI parsing is the `match` in `lib.rs::parse`; `--help` is the `HELP` const. Keep both in sync.
-- Logging is the `info!` / `warn!` / `error!` / `debug!` macros in `lib.rs` (stderr).
-  `--verbose` / `-v` enables `debug!` (internal steps, diffs, "trying..." messages).
-  `println!` is retained for data output (JSON, tab-separated list).
+- Logging is the `info!` / `warn!` / `error!` / `debug!` macros in `lib.rs` (stderr);
+  `-v` enables `debug!`. `println!` is for data output (`list`).
 - Runtime tools: `nix`, `git`, `curl`, optionally `gh`.
+- Every `nix` call references the checkout as `path:<root>`, which copies it. Keep the
+  number of calls per package low: `nix::package_info` is the one evaluation for
+  everything about a package (file, versions, output path, src URLs, meta links), taken
+  once before and once after an update.
 
 ## NixOS module
 
-The module at `modules/nixos/bumpkin.nix` creates one systemd timer + oneshot service per
-maintainer. Each service iterates over `packageSets`, clones or fast-forwards each repo,
-then runs `bumpkin update --root <path> --maintainer <name>`.
-
-Options exposed to NixOS:
-- `services.bumpkin.enable`
-- `services.bumpkin.maintainers` - list of maintainer handles
-- `services.bumpkin.packageSets` - list of flake refs (string sugar) or attrsets with `repo`, `branch`, `path`, `forge`, `forgeApiUrl`, `noBuild`, `branchPrefix`, `gitUserName`, `gitUserEmail`
-- `services.bumpkin.branchPrefix` - per-package branch prefix (default `bumpkin/`); per-packageSet `branchPrefix` overrides it
-- `services.bumpkin.actions.commit` / `.signed` / `.push` / `.pr` - batch commit/push/PR behaviour
-- `services.bumpkin.forgeTokenFile` - path to forge PAT file (GitHub, Gitea, Forgejo)
-- `services.bumpkin.gpgKeyFile` - path to ASCII-armored GPG key for sign+import
-- `services.bumpkin.git.userName` / `.userEmail` / `.gpgFormat` / `.signingKey` / `.sshKeyFile`
-- `services.bumpkin.schedule` / `.randomizedDelaySec` - timer tuning
-- `services.bumpkin.package` - the bumpkin derivation (auto-set by `nixosModules.default`)
+One systemd timer + oneshot service per maintainer. Each service iterates over
+`packageSets`, clones or resets each checkout to its upstream branch (under a lock), then
+runs `bumpkin update --root <path> --maintainer <name>`. Options are documented in the
+README table; `nix flake check` evaluates the module with a minimal config.
 
 ## Useful commands
 
 ```sh
-nix develop -c cargo check
 nix develop -c cargo test --lib
+nix develop -c cargo clippy --all-targets
 nix develop -c cargo build --release
+nix flake check                                                              # package + NixOS module eval
 ./target/release/bumpkin list --maintainer 74k1 --root $HOME/dev/tixpkgs
-./target/release/bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs
-./target/release/bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs --verbose  # debug details
-./target/release/bumpkin run-update-script --package arcbrush --root $HOME/dev/tixpkgs
-./target/release/bumpkin update --package arcbrush --root $HOME/dev/tixpkgs
-./target/release/bumpkin update --package arcbrush --root $HOME/dev/tixpkgs --commit --signed
-
-# Batch maintainer: dry-run (temp worktrees, no mutation)
-./target/release/bumpkin update --root $HOME/dev/tixpkgs --maintainer 74k1
-
-# Batch maintainer: per-package branches, commit, push
-./target/release/bumpkin update --root $HOME/dev/tixpkgs --maintainer 74k1 --commit --signed --push
-
-# Per-machine build blocklist (env var, comma-separated)
-BUMPKIN_SKIP=waterfox,waterfox-unwrapped ./target/release/bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs
-./target/release/bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build waterfox,waterfox-unwrapped
-
-# NixOS module test
-nix flake check
+./target/release/bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs -v    # dry run
+./target/release/bumpkin update --package arcbrush --root $HOME/dev/tixpkgs      # in place
+./target/release/bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --signed --push --pr
 ```
 
-## Current caveats
+## Behaviour worth knowing
 
-- Maintainer scans evaluate `packages.$system.*.meta.maintainers`; there is no source-scan fallback.
-- `run-update-script` supports flake package outputs, checks `passthru.updateScript` plus top-level `updateScript`.
+Updating:
+- A failing updateScript is an error; the native updater only runs when there is no updateScript.
+- updateScripts get `UPDATE_NIX_ATTR_PATH` / `_NAME` / `_PNAME` / `_OLD_VERSION` like nixpkgs'
+  `update.py`. List-style `nix-update` scripts get `--flake` injected when the repo has no
+  root `default.nix`; legacyPackages-only packages get the full attr path.
 - Bare-path updateScripts flattened into the read-only store are run from a byte-identical
-  copy in the checkout's package directory (probed write access, content match), so scripts
-  that write next to themselves work.
-- Per-package branches are `<branchPrefix><package>` (`--branch-prefix` / config `branchPrefix`, default `bumpkin/`). The prefix must be non-empty because leftover branches with that name are force-deleted at the start of each package.
-- updateScripts get `UPDATE_NIX_ATTR_PATH` / `UPDATE_NIX_NAME` / `UPDATE_NIX_PNAME` /
-  `UPDATE_NIX_OLD_VERSION` like nixpkgs' `update.py`. List-style `nix-update` scripts
-  (`nix-update-script`) get `--flake` injected when the repo has no root `default.nix`
-  and no `--flake`/`--file` arg is present; legacyPackages-only packages get
-  `UPDATE_NIX_ATTR_PATH=legacyPackages.<system>.<name>` in that mode.
-- A failing updateScript is reported as an error; the native updater is only used when no updateScript exists.
-- Diffs are printed only with `--verbose` (git writes them straight to stdout).
-- `update --maintainer --commit` runs per-package branches sequentially; it does not parallelize across packages (Nix builds are single-instance anyway).
-- `update --package` supports `--commit --push --pr` too (per-package branch flow, same as batch mode); `--push` requires `--commit`, `--pr` requires `--push`.
-- Commit mode refuses to run from a detached HEAD (no branch to return to).
-- Registry-based sources (`fetchPypi`, `fetchCrate`, ...) and non-git VCSes still need updateScripts; the native updater handles git-hosted sources only.
-- Non-numeric versions (rc/beta tags, `unstable-…` dates) are skipped by the native updater.
-- Multi-platform builds are not supported; bumpkin builds only on the local system.
-- No CVE checking or rebuild-impact estimation (unlike nixpkgs-update).
-- PR bodies carry two best-effort extras: an upstream compare link (git URL + tag prefix from the package file; none for sourcehut or when no prefix is found) and a version check that runs the built `bin/*` with `--version` / `-V` / `--help` inside a Nix derivation (60s timeout); it is skipped unless `nix config show sandbox` is `true`/`relaxed`, so upstream binaries never run unsandboxed. Neither blocks the PR.
-- No PR lookup: per-package branches are force-pushed (an open PR is updated in place) and a create-PR response containing "already exists" is treated as success. `auto` forge = `gh` for github.com, otherwise the REST API of the `origin` host (`https://<host>/api/v1` for non-GitHub).
-- Commit mode discards leftovers of a failed update (`checkout -f` + `git clean -fd`); it never resets the main branch.
-- Signing options (`--signing-key`, `--gpg-format`) are passed as one-off `git -c`, never written to the repo config.
-- Packages the native updater cannot handle return an `unsupported: ` error and count as skipped in batch mode.
-- Dependency hash refresh covers: `cargoHash`, `vendorHash`, `npmDepsHash`, `yarnHash`, `pomHash`, `mvnHash`, `mixHash`, `nugetHash`, `dotnetHash`; multiple hashes per package are resolved iteratively.
-- `noBuild` (`--no-build`) is per-packageSet in the NixOS module, comma-separated at the CLI. A bare `--no-build` skips all builds. Skipped packages still get version/hash updates, commits, and PRs; only the `nix build` step is omitted.
-- `BUMPKIN_SKIP` (comma-separated env var) applies to both `dry-run` and `update`.
-- `nix flake check` builds the package (incl. cargo tests) and evaluates the NixOS module with a minimal config (`checks.<system>.nixos-module`).
+  copy in the package directory, so scripts that write next to themselves work.
+- Native updater limits: git-hosted, version-linked sources with numeric versions only.
+  Anything else returns an `unsupported: ` error and counts as skipped in batch mode.
+- Dependency hashes refreshed: `cargoHash`, `vendorHash`, `npmDepsHash`, `yarnHash`,
+  `pomHash`, `mvnHash`, `mixHash`, `nugetHash`, `dotnetHash`.
+- A numeric version downgrade after an update is an error.
+- `--no-build` takes a list; without a value it skips all builds. Skipped packages still
+  get updated, committed and PR'd. `--skip` / `BUMPKIN_SKIP` skip packages entirely.
+
+Committing and PRs:
+- Commit mode needs a clean tree and a branch (no detached HEAD). It discards leftovers of
+  a failed update (`checkout -f` + `git clean -fd`) and never resets the main branch.
+- Leftover `<branchPrefix><package>` branches are force-deleted, hence the non-empty prefix.
+- Branches are force-pushed unless the remote already has identical content; a create-PR
+  response containing "already exists" counts as success.
+- `auto` forge: `gh` for github.com, otherwise the REST API of the `origin` host.
+- Signing options are passed as one-off `git -c`, never written to the repo config.
+- PR body extras are best-effort and never block: compare link, `meta.changelog` /
+  `meta.homepage`, dependents (via `nix-store --query --referrers-closure`; nothing for
+  legacyPackages-only sets), closure diff (only if the old output is still in the store),
+  and a version check that runs `bin/*` inside a Nix derivation (skipped unless the Nix
+  sandbox is on, so upstream binaries never run unsandboxed).
+
+Not supported: multi-platform builds, CVE checks, registry version lookups, parallel batch runs.

@@ -42,39 +42,38 @@ Bumpkin is a Rust/Nix flake upkeep bot. It should work for arbitrary flake packa
    - requires a version-linked source: a `rev`/`tag`/`url` assignment
      referencing `${version}` (or bare `version`/`finalAttrs.version`);
      pinned-rev packages are skipped.
+   - the package file comes from `meta.position` (no hardcoded `pkgs/` layout).
    - `rev`/`tag`/`url` and the src hash are looked up inside the
      `src = fetcher { ... }` attrset first (whole file as fallback), so
      `fetchpatch` URLs/hashes are not mistaken for the source.
-3. Repology API (last resort - version hint only, never drives updates)
 
 ## Project layout
 
 ```
 src/
-  main.rs        # Tracing init, CLI parse entrypoint, error exit
-  lib.rs         # Clap CLI structs (Commands, flags), config loading, command dispatch
-  update.rs      # Update logic: dry-run, per-package update, batch maintainer update,
-                 #   native updater (git ls-remote tags + Nix-computed hashes),
-                 #   fake-hash refresh loop (src + cargoHash, vendorHash, npmDepsHash, etc.),
-                 #   GitHub redirect detection (updates owner/repo on transfer)
-  packages.rs    # Package discovery, maintainer filtering, fetcher classification
-  nix.rs         # Nix evaluation: package version, build, updateScript, maintainer query,
-                 #   src info (gitRepoUrl/urls), flake input info (nixpkgs rev for PR bodies)
+  main.rs        # Parse args, run, error exit
+  lib.rs         # Log macros, hand-rolled CLI parser (Args, --help), command dispatch
+  update.rs      # Update logic: per-package update, batch maintainer update, temp-worktree
+                 #   dry run, native updater (git ls-remote tags + Nix-computed hashes),
+                 #   fake-hash refresh loop (src + cargoHash, vendorHash, npmDepsHash, etc.)
+  nix.rs         # Nix evaluation: maintainer query, package info (file via meta.position,
+                 #   name/version, src gitRepoUrl/urls), build, updateScript,
+                 #   flake input info (nixpkgs rev for PR bodies)
   git.rs         # Git helpers: branch, commit, push, diff, remote_url
-  forge.rs       # Forge abstraction: PR create/find via gh CLI, GitHub REST API, Gitea/Forgejo REST API
-  repology.rs    # Repology.org version oracle (free, no API key)
+  forge.rs       # PR creation via gh CLI or curl against the GitHub / Gitea / Forgejo REST API
 modules/nixos/
   bumpkin.nix    # NixOS module: systemd timers + oneshot services
 ```
 
 ## Dependencies
 
-- **clap** (derive): CLI argument parsing, subcommand dispatch, auto-generated `--help`.
-- **tracing** / **tracing-subscriber** (env-filter): structured logging.
-  - Default level: `info` (per-package results, summary).
-  - `--verbose` / `-v` enables `debug` (internal steps, diffs, "trying..." messages).
-  - `RUST_LOG` env var overrides both (e.g., `RUST_LOG=warn` for quiet runs).
-  - `println!` is retained for data output (JSON, tab-separated list); logs go to stderr.
+None. Keep it that way unless there is a very strong reason.
+
+- CLI parsing is the `match` in `lib.rs::parse`; `--help` is the `HELP` const. Keep both in sync.
+- Logging is the `info!` / `warn!` / `error!` / `debug!` macros in `lib.rs` (stderr).
+  `--verbose` / `-v` enables `debug!` (internal steps, diffs, "trying..." messages).
+  `println!` is retained for data output (JSON, tab-separated list).
+- Runtime tools: `nix`, `git`, `curl`, optionally `gh`.
 
 ## NixOS module
 
@@ -90,9 +89,8 @@ Options exposed to NixOS:
 - `services.bumpkin.actions.commit` / `.signed` / `.push` / `.pr` - batch commit/push/PR behaviour
 - `services.bumpkin.forgeTokenFile` - path to forge PAT file (GitHub, Gitea, Forgejo)
 - `services.bumpkin.gpgKeyFile` - path to ASCII-armored GPG key for sign+import
-- `services.bumpkin.git.userName` / `.userEmail` / `.gpgFormat` / `.signingKey` / `.sshKeyFile` / `.extraConfig`
+- `services.bumpkin.git.userName` / `.userEmail` / `.gpgFormat` / `.signingKey` / `.sshKeyFile`
 - `services.bumpkin.schedule` / `.randomizedDelaySec` - timer tuning
-- `services.bumpkin.gc.enable` - periodic `nix store gc`
 - `services.bumpkin.package` - the bumpkin derivation (auto-set by `nixosModules.default`)
 
 ## Useful commands
@@ -124,7 +122,7 @@ nix flake check
 
 ## Current caveats
 
-- Maintainer scans default to evaluating `packages.$system.*.meta.maintainers`; source scanning is a fallback.
+- Maintainer scans evaluate `packages.$system.*.meta.maintainers`; there is no source-scan fallback.
 - `run-update-script` supports flake package outputs, checks `passthru.updateScript` plus top-level `updateScript`.
 - Bare-path updateScripts flattened into the read-only store are run from a byte-identical
   copy in the checkout's package directory (probed write access, content match), so scripts
@@ -140,16 +138,15 @@ nix flake check
 - `update --maintainer --commit` runs per-package branches sequentially; it does not parallelize across packages (Nix builds are single-instance anyway).
 - `update --package` supports `--commit --push --pr` too (per-package branch flow, same as batch mode); `--push` requires `--commit`, `--pr` requires `--push`.
 - Commit mode refuses to run from a detached HEAD (no branch to return to).
-- Repology is a fallback version hint only; it does not drive the primary update flow.
 - Registry-based sources (`fetchPypi`, `fetchCrate`, ...) and non-git VCSes still need updateScripts; the native updater handles git-hosted sources only.
 - Non-numeric versions (rc/beta tags, `unstable-…` dates) are skipped by the native updater.
-- GitHub repo transfers are detected via 301 redirect and the `owner`/`repo`
-  fields in the nix file are updated automatically; the redirect check runs
-  before any updateScript or native-fetcher update.
 - Multi-platform builds are not supported; bumpkin builds only on the local system.
 - No CVE checking or rebuild-impact estimation (unlike nixpkgs-update).
-- Forge PR dedup covers `gh` CLI, GitHub REST API, and Gitea/Forgejo REST API. Gitea/Forgejo do not support the `head=` filter, so matching is done client-side on `head.ref`.
+- No PR lookup: per-package branches are force-pushed (an open PR is updated in place) and a create-PR response containing "already exists" is treated as success. `auto` forge = `gh` for github.com, otherwise the REST API of the `origin` host (`https://<host>/api/v1` for non-GitHub).
+- Commit mode discards leftovers of a failed update (`checkout -f` + `git clean -fd`); it never resets the main branch.
+- Signing options (`--signing-key`, `--gpg-format`) are passed as one-off `git -c`, never written to the repo config.
+- Packages the native updater cannot handle return an `unsupported: ` error and count as skipped in batch mode.
 - Dependency hash refresh covers: `cargoHash`, `vendorHash`, `npmDepsHash`, `yarnHash`, `pomHash`, `mvnHash`, `mixHash`, `nugetHash`, `dotnetHash`; multiple hashes per package are resolved iteratively.
-- `noBuild` (`--no-build`) is per-packageSet in the NixOS module, comma-separated at the CLI. Skipped packages still get version/hash updates, commits, and PRs; only the `nix build` step is omitted.
+- `noBuild` (`--no-build`) is per-packageSet in the NixOS module, comma-separated at the CLI. A bare `--no-build` skips all builds. Skipped packages still get version/hash updates, commits, and PRs; only the `nix build` step is omitted.
 - `BUMPKIN_SKIP` (comma-separated env var) applies to both `dry-run` and `update`.
 - `nix flake check` builds the package (incl. cargo tests) and evaluates the NixOS module with a minimal config (`checks.<system>.nixos-module`).

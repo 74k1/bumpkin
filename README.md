@@ -39,7 +39,7 @@ nix develop -c cargo build --release
 # Discover packages
 bumpkin list --maintainer 74k1 --root $HOME/dev/tixpkgs
 
-# Dry-run (temp worktree, no mutation)
+# Dry-run (temp worktree, no mutation; same as `update --maintainer` without --commit)
 bumpkin dry-run --package arcbrush --root $HOME/dev/tixpkgs
 bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs
 
@@ -58,9 +58,12 @@ bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --branch-pref
 # Per-machine blocklist (works for dry-run and update)
 BUMPKIN_SKIP=waterfox,waterfox-unwrapped bumpkin dry-run --maintainer 74k1 --root $HOME/dev/tixpkgs
 bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build waterfox,waterfox-unwrapped
+
+# Skip all builds (bare --no-build)
+bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build
 ```
 
-**Update priority:** package-owned `updateScript` → native updater → Repology (version hint only).
+**Update priority:** package-owned `updateScript` → native updater.
 
 **updateScripts:** Nix builds a bare-path script (for example `./update.sh`) into a
 read-only file in the Nix store. A script that writes next to itself then fails. If the
@@ -83,11 +86,9 @@ the fetcher itself, every fetcher is supported as long as the source is
 git-hosted and version-linked (`rev`/`tag`/`url` referencing `${version}`
 or bare `rev = version;`). `rev`/`tag`/`url` and the src hash are read from
 the `src = fetcher { ... }` attrset first, so patch URLs and hashes elsewhere in
-the file are left alone.  GitHub repository **transfers** are detected
-automatically (via 301 redirect) and the `owner`/`repo` fields are
-updated in-place before any update runs.
+the file are left alone. The package file is located via `meta.position`.
 
-**Forge backends:** `auto` (the `gh` CLI if it is installed, otherwise the GitHub REST API), `github-cli`, `github-api`, `api` (Gitea/Forgejo REST API).
+**Forge backends:** `auto` (for github.com the `gh` CLI if it is installed, otherwise the REST API of the `origin` host: GitHub, or Gitea/Forgejo at `https://<host>/api/v1`), `github-cli`, `github-api`, `api`. Per-package branches are force-pushed, so an open PR is updated in place instead of duplicated.
 
 **Dependency hash refresh:** `cargoHash`, `vendorHash`, `npmDepsHash`, `yarnHash`, `pomHash`, `mvnHash`, `mixHash`, `nugetHash`, `dotnetHash`.
 
@@ -152,7 +153,6 @@ Use `default` unless you need a custom bumpkin derivation:
     };
 
     schedule = "daily";
-    gc.enable = true;
   };
 }
 ```
@@ -167,8 +167,8 @@ Use `default` unless you need a custom bumpkin derivation:
 | `packageSets.*.repo` | str | (required) | Flake ref (`github:owner/repo`) or git URL |
 | `packageSets.*.branch` | null or str | `null` | Branch to track (null = auto-discover) |
 | `packageSets.*.path` | null or str | `null` | Checkout path (default: `/var/lib/bumpkin/<owner>/<repo>`) |
-| `packageSets.*.forge` | null or str | `null` | Forge backend override (null = auto-detect) |
-| `packageSets.*.forgeApiUrl` | null or str | `null` | API URL for `api` forge |
+| `packageSets.*.forge` | null or str | `null` | Forge backend override (null = `auto`) |
+| `packageSets.*.forgeApiUrl` | null or str | `null` | REST API base URL (null = derived from the repo host) |
 | `packageSets.*.noBuild` | list of str | `[]` | Package attr names to skip building (still update/commit/PR) |
 | `packageSets.*.branchPrefix` | null or str | `null` | Branch prefix override for this set (null = `branchPrefix`) |
 | `packageSets.*.pr` | null or bool | `null` | PR override for this set (null = `actions.pr`) |
@@ -186,11 +186,8 @@ Use `default` unless you need a custom bumpkin derivation:
 | `git.gpgFormat` | null or str | `null` | `"openpgp"` or `"ssh"` |
 | `git.signingKey` | null or str | `null` | GPG key fingerprint or SSH pubkey path |
 | `git.sshKeyFile` | null or str | `null` | SSH private key for git transport |
-| `git.extraConfig` | attrs | `{}` | Additional git config |
 | `schedule` | str | `"daily"` | Systemd calendar event |
 | `randomizedDelaySec` | int | `3600` | Max random delay before run |
-| `gc.enable` | bool | `false` | Periodic Nix store GC |
-| `gc.schedule` | str | `"weekly"` | GC calendar event |
 
 ### Auth
 
@@ -216,6 +213,6 @@ systemctl list-timers 'bumpkin-*'
 
 ## Requirements
 
-Runtime: `nix` (with flakes), `git`, `jq`, `curl`. Optional: `gh` (GitHub CLI), `gnupg` (GPG signing), `openssh` (SSH push).
+Runtime: `nix` (with flakes), `git`, `curl`. Optional: `gh` (GitHub CLI), `gnupg` (GPG signing), `openssh` (SSH push).
 
 Repository shape: flake root with `flake.nix`, packages at `packages.$system.<attr>` or `legacyPackages.$system.<attr>`.

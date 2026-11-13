@@ -4,43 +4,32 @@ let
   cfg = config.services.bumpkin;
   inherit (lib) types mkOption mkEnableOption mkIf;
 
-  stripDotGit = s:
-    let m = builtins.match "(.+)\\.git$" s;
-    in if m != null then builtins.head m else s;
-
-  extractOwnerRepo = ref:
+  # Git clone URL for a flake ref (`github:owner/repo[/branch]`, ...) or a raw git URL.
+  cloneUrl = ref:
     let
-      flakeMatch = builtins.match "^(github|gitlab|sourcehut):([^/]+)/([^/]+)(/.*)?$" ref;
-      sshMatch    = builtins.match "^git@([^:]+):([^/]+)/([^/]+)$" ref;
-      scpMatch    = builtins.match "^[^/@]+@([^:]+):([^/]+)/([^/]+)$" ref;
-      sshUrlMatch = builtins.match "^(git\\+ssh|ssh)://[^@]+@([^/]+)/([^/]+)/([^/]+)(/.*)?$" ref;
-      httpsMatch  = builtins.match "^https?://[^/]+/([^/]+)/([^/]+)$" ref;
+      m = builtins.match "(github|gitlab|sourcehut):([^/]+)/([^/]+)(/.*)?" ref;
+      hosts = {
+        github = "https://github.com/";
+        gitlab = "https://gitlab.com/";
+        sourcehut = "https://git.sr.ht/~";
+      };
     in
-      if flakeMatch != null then {
-        owner = builtins.elemAt flakeMatch 1;
-        repo  = builtins.elemAt flakeMatch 2;
-      }
-      else if sshMatch != null then {
-        owner = builtins.elemAt sshMatch 1;
-        repo  = stripDotGit (builtins.elemAt sshMatch 2);
-      }
-      else if scpMatch != null then {
-        owner = builtins.elemAt scpMatch 1;
-        repo  = stripDotGit (builtins.elemAt scpMatch 2);
-      }
-      else if sshUrlMatch != null then {
-        owner = builtins.elemAt sshUrlMatch 2;
-        repo  = stripDotGit (builtins.elemAt sshUrlMatch 3);
-      }
-      else if httpsMatch != null then {
-        owner = builtins.elemAt httpsMatch 0;
-        repo  = stripDotGit (builtins.elemAt httpsMatch 1);
-      }
-      else throw "cannot extract owner/repo from ref: ${ref}";
+      if m == null then lib.removePrefix "git+" ref
+      else "${hosts.${builtins.elemAt m 0}}${builtins.elemAt m 1}/${builtins.elemAt m 2}";
 
   defaultPath = ps:
-    let info = extractOwnerRepo ps.repo;
-    in "/var/lib/bumpkin/${info.owner}/${info.repo}";
+    let m = builtins.match ".*[:/]~?([^/:]+)/([^/]+)" (lib.removeSuffix ".git" (cloneUrl ps.repo));
+    in if m == null then throw "cannot extract owner/repo from ref: ${ps.repo}"
+       else "/var/lib/bumpkin/${builtins.elemAt m 0}/${builtins.elemAt m 1}";
+
+  gitConfig = pkgs.writeText "bumpkin-gitconfig" (lib.generators.toGitINI {
+    user = lib.filterAttrs (_: v: v != null) {
+      name = cfg.git.userName;
+      email = cfg.git.userEmail;
+      signingkey = cfg.git.signingKey;
+    };
+    gpg = lib.optionalAttrs (cfg.git.gpgFormat != null) { format = cfg.git.gpgFormat; };
+  });
 
   bumpkinCmd = "${cfg.package}/bin/bumpkin";
 
@@ -58,7 +47,7 @@ let
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
 
-    path = [ cfg.package pkgs.git pkgs.nix pkgs.curl pkgs.jq pkgs.gh pkgs.util-linux ]
+    path = [ cfg.package pkgs.git pkgs.nix pkgs.curl pkgs.gh pkgs.util-linux ]
       ++ lib.optional (cfg.git.gpgFormat == "openpgp" || cfg.gpgKeyFile != null) pkgs.gnupg
       ++ lib.optional (cfg.git.sshKeyFile != null) pkgs.openssh;
 
@@ -74,6 +63,9 @@ let
     environment = {
       HOME = "/var/lib/bumpkin";
       NIX_PATH = "nixpkgs=${pkgs.path}";
+      # For updateScripts that call nix themselves; scoped to this service.
+      NIX_CONFIG = "extra-experimental-features = nix-command flakes";
+      GIT_CONFIG_GLOBAL = gitConfig;
     } // lib.optionalAttrs (cfg.git.userName != null) {
       GIT_AUTHOR_NAME = cfg.git.userName;
       GIT_AUTHOR_EMAIL = cfg.git.userEmail;
@@ -86,19 +78,25 @@ let
 
     script =
       let
-        pkgSetBlock = idx: ps:
+        pkgSetBlock = ps:
           let
             checkout = if ps.path != null then ps.path else defaultPath ps;
-            branchPrefix = if ps.branchPrefix != null then ps.branchPrefix else cfg.branchPrefix;
+            args = [
+              "--maintainer" maintainer
+              "--branch-prefix" (if ps.branchPrefix != null then ps.branchPrefix else cfg.branchPrefix)
+            ]
+            ++ lib.optionals (ps.forge != null) [ "--forge" ps.forge ]
+            ++ lib.optionals (ps.forgeApiUrl != null) [ "--forge-api-url" ps.forgeApiUrl ]
+            ++ lib.optional cfg.actions.commit "--commit"
+            ++ lib.optional cfg.actions.signed "--signed"
+            ++ lib.optional cfg.actions.push "--push"
+            ++ lib.optional (if ps.pr != null then ps.pr else cfg.actions.pr) "--pr"
+            ++ lib.optionals (ps.noBuild != []) [ "--no-build" (lib.concatStringsSep "," ps.noBuild) ]
+            ++ lib.optionals (cfg.skip != []) [ "--skip" (lib.concatStringsSep "," cfg.skip) ];
           in ''
-            CHECKOUT_PATH="${checkout}"
-            REPO_REF="${ps.repo}"
-            ${lib.optionalString (ps.branch != null) ''
-            CFG_BRANCH="${ps.branch}"''}
-            ${lib.optionalString (ps.forge != null) ''
-            CFG_FORGE="${ps.forge}"''}
-            ${lib.optionalString (ps.forgeApiUrl != null) ''
-            CFG_FORGE_API="${ps.forgeApiUrl}"''}
+            CHECKOUT_PATH=${lib.escapeShellArg checkout}
+            CLONE_URL=${lib.escapeShellArg (cloneUrl ps.repo)}
+            BRANCH=${lib.escapeShellArg (toString ps.branch)}
 
             mkdir -p "$(dirname "$CHECKOUT_PATH")"
             # Serialize access to the checkout: services for different
@@ -111,38 +109,6 @@ let
             export GITHUB_TOKEN="$(cat ${ps.forgeTokenFile})"
             ''}
 
-            # Resolve clone URL via nix flake metadata.
-            META_FILE="/tmp/bumpkin-meta-${toString idx}.json"
-            if nix --extra-experimental-features 'flakes nix-command' \
-                   flake metadata --json "$REPO_REF" >"$META_FILE" 2>/dev/null; then
-              META_TYPE=$(jq -r '.resolved.type // "git"' "$META_FILE")
-              case "$META_TYPE" in
-                github)
-                  OWNER=$(jq -r '.resolved.owner' "$META_FILE")
-                  REPO=$(jq -r '.resolved.repo' "$META_FILE")
-                  CLONE_URL="https://github.com/$OWNER/$REPO.git"
-                  ;;
-                gitlab)
-                  OWNER=$(jq -r '.resolved.owner' "$META_FILE")
-                  REPO=$(jq -r '.resolved.repo' "$META_FILE")
-                  CLONE_URL="https://gitlab.com/$OWNER/$REPO.git"
-                  ;;
-                sourcehut)
-                  OWNER=$(jq -r '.resolved.owner' "$META_FILE")
-                  REPO=$(jq -r '.resolved.repo' "$META_FILE")
-                  CLONE_URL="https://git.sr.ht/~$OWNER/$REPO"
-                  ;;
-                *)
-                  CLONE_URL=$(jq -r '.resolved.url // .original.url // empty' "$META_FILE")
-                  ;;
-              esac
-              [ -z "$CLONE_URL" ] && CLONE_URL="$REPO_REF"
-            else
-              CLONE_URL="$REPO_REF"
-              META_TYPE="git"
-              META_FILE=""
-            fi
-
             # HTTPS auth comes from the credential helper (reads GITHUB_TOKEN
             # from the environment), so the token is never part of the remote
             # URL. SSH auth is handled by GIT_SSH_COMMAND.
@@ -154,9 +120,7 @@ let
             git -C "$CHECKOUT_PATH" fetch origin --prune
 
             # Branch selection: explicit > auto-discovered from upstream HEAD.
-            if [ -n "''${CFG_BRANCH:-}" ]; then
-              BRANCH="$CFG_BRANCH"
-            else
+            if [ -z "$BRANCH" ]; then
               BRANCH=$(git -C "$CHECKOUT_PATH" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|.*/||')
               [ -z "$BRANCH" ] && BRANCH=$(git -C "$CHECKOUT_PATH" rev-parse --abbrev-ref HEAD)
             fi
@@ -165,23 +129,6 @@ let
             git -C "$CHECKOUT_PATH" checkout -f "$BRANCH"
             git -C "$CHECKOUT_PATH" reset --hard "origin/$BRANCH"
             git -C "$CHECKOUT_PATH" clean -fdx
-
-            # Resolve forge backend.
-            if [ -n "''${CFG_FORGE:-}" ]; then
-              FORGE="$CFG_FORGE"
-            elif [ -n "$META_FILE" ] && [ -f "$META_FILE" ]; then
-              case "$META_TYPE" in
-                github) FORGE="auto" ;;
-                gitlab) FORGE="api" ;;
-                *) FORGE="api" ;;
-              esac
-            else
-              case "$CLONE_URL" in
-                *github.com*) FORGE="auto" ;;
-                *gitlab.com*) FORGE="api" ;;
-                *) FORGE="api" ;;
-              esac
-            fi
 
             cd "$CHECKOUT_PATH"
             # Per-packageSet commit identity overrides the service-level one.
@@ -192,18 +139,7 @@ let
             ${lib.optionalString (ps.gitUserEmail != null) ''
             export GIT_AUTHOR_EMAIL=${lib.escapeShellArg ps.gitUserEmail} GIT_COMMITTER_EMAIL=${lib.escapeShellArg ps.gitUserEmail}
             ''}
-            ${bumpkinCmd} update \
-              --root "$CHECKOUT_PATH" \
-              --maintainer ${maintainer} \
-              --forge "$FORGE" \
-              --branch-prefix ${lib.escapeShellArg branchPrefix} \
-              ''${CFG_FORGE_API:+--forge-api-url "$CFG_FORGE_API"} \
-              ${if cfg.actions.commit then "--commit" else ""} \
-              ${if cfg.actions.signed then "--signed" else ""} \
-              ${if cfg.actions.push   then "--push"   else ""} \
-              ${if (if ps.pr != null then ps.pr else cfg.actions.pr) then "--pr" else ""} \
-              ${if ps.noBuild != [] then "--no-build ${lib.concatStringsSep "," ps.noBuild}" else ""} \
-              ${if cfg.skip != [] then "--skip ${lib.concatStringsSep "," cfg.skip}" else ""}
+            ${bumpkinCmd} update ${lib.escapeShellArgs args} --root "$CHECKOUT_PATH"
 
             ) 9>"$CHECKOUT_PATH.lock"
 
@@ -225,7 +161,7 @@ let
         ${lib.optionalString (cfg.gpgKeyFile != null) ''
         gpg --import ${cfg.gpgKeyFile}''}
 
-        ${lib.concatStringsSep "\n" (lib.imap0 (i: ps: pkgSetBlock i ps) cfg.packageSets)}
+        ${lib.concatMapStringsSep "\n" pkgSetBlock cfg.packageSets}
       '';
   };
 
@@ -373,8 +309,8 @@ in
                   `user@host:owner/repo.git`,
                   `git+ssh://user@host/owner/repo.git`
 
-                Flake refs are resolved at runtime via `nix flake metadata`.
-                Raw git URLs are used directly.
+                Flake refs are mapped to their clone URL; raw git URLs are
+                used directly.
               '';
             };
 
@@ -403,13 +339,13 @@ in
               description = ''
                 Forge backend for PR creation.
 
-                - `auto`: prefer `gh` CLI if available, fall back to GitHub API
+                - `auto`: `gh` CLI for github.com if available, else the REST API
                 - `github-cli`: always use `gh` CLI
                 - `github-api`: use GitHub REST API via curl
                 - `api`: use a GitHub-compatible REST API via curl (Gitea, Forgejo)
 
-                If null (default), the forge is auto-detected from flake
-                metadata or the repo URL.
+                If null (default), `auto` is used: `gh` for github.com,
+                otherwise the REST API of the repo's host.
               '';
             };
 
@@ -418,12 +354,9 @@ in
               default = null;
               example = "https://gitea.example.com/api/v1";
               description = ''
-                API base URL when `forge` is `api`.
-
-                - Gitea: `https://gitea.example.com/api/v1`
-                - Forgejo: `https://forgejo.example.com/api/v1`
-
-                Only used when `forge` is explicitly `api`. Ignored otherwise.
+                API base URL for the REST backends. Defaults to
+                `https://api.github.com` for github.com and
+                `https://<host>/api/v1` (Gitea, Forgejo) for other hosts.
               '';
             };
 
@@ -546,34 +479,10 @@ in
           (PR creation).
         '';
       };
-
-      extraConfig = mkOption {
-        type = types.attrsOf types.str;
-        default = {};
-        description = "Additional git config entries.";
-        example = { "core.sshCommand" = "ssh -i /path/to/deploy-key"; };
-      };
-    };
-
-    gc = {
-      enable = mkEnableOption "periodic Nix store garbage collection";
-      schedule = mkOption {
-        type = types.str;
-        default = "weekly";
-        description = "Systemd calendar event for GC.";
-      };
-      randomizedDelaySec = mkOption {
-        type = types.ints.unsigned;
-        default = 7200;
-        description = "Random delay for GC in seconds.";
-      };
     };
   };
 
   config = mkIf cfg.enable {
-    nix.settings.experimental-features = [ "nix-command" "flakes" ];
-    nix.nixPath = [ "nixpkgs=${pkgs.path}" ];
-
     users.users = mkIf (cfg.user == "bumpkin") {
       bumpkin = {
         isSystemUser = true;
@@ -588,52 +497,13 @@ in
       bumpkin = {};
     };
 
-    environment.etc."bumpkin-home-gitconfig".source = let
-      extraLines = lib.mapAttrsToList (k: v: "\t${k} = ${v}") cfg.git.extraConfig;
-    in pkgs.writeText "gitconfig" ''
-      [user]
-      ${lib.optionalString (cfg.git.userName != null) "\tname = ${cfg.git.userName}"}
-      ${lib.optionalString (cfg.git.userEmail != null) "\temail = ${cfg.git.userEmail}"}
-      ${lib.optionalString (cfg.git.signingKey != null) "\tsigningkey = ${cfg.git.signingKey}"}
-      ${lib.optionalString (cfg.git.gpgFormat != null) ''
-      [gpg]
-      	format = ${cfg.git.gpgFormat}''}
-      ${lib.concatStringsSep "\n" extraLines}
-    '';
-    systemd.tmpfiles.rules = [
-      "L+ /var/lib/bumpkin/.gitconfig - - - - /etc/bumpkin-home-gitconfig"
-    ];
+    systemd.services = lib.listToAttrs (map (maintainer:
+      lib.nameValuePair "bumpkin-${maintainer}" (serviceUnit maintainer)
+    ) cfg.maintainers);
 
-    systemd.services =
-      (lib.listToAttrs (map (maintainer:
-        lib.nameValuePair "bumpkin-${maintainer}" (serviceUnit maintainer)
-      ) cfg.maintainers))
-      // lib.optionalAttrs cfg.gc.enable {
-        "bumpkin-gc" = {
-          description = "Bumpkin Nix store garbage collection";
-          serviceConfig = {
-            Type = "oneshot";
-            User = cfg.user;
-            ExecStart = "${pkgs.nix}/bin/nix store gc";
-          };
-        };
-      };
-
-    systemd.timers =
-      (lib.listToAttrs (map (maintainer:
-        lib.nameValuePair "bumpkin-${maintainer}" (timerUnit maintainer)
-      ) cfg.maintainers))
-      // lib.optionalAttrs cfg.gc.enable {
-        "bumpkin-gc" = {
-          description = "Bumpkin periodic Nix store GC";
-          wantedBy = [ "timers.target" ];
-          timerConfig = {
-            OnCalendar = cfg.gc.schedule;
-            RandomizedDelaySec = cfg.gc.randomizedDelaySec;
-            Persistent = true;
-          };
-        };
-      };
+    systemd.timers = lib.listToAttrs (map (maintainer:
+      lib.nameValuePair "bumpkin-${maintainer}" (timerUnit maintainer)
+    ) cfg.maintainers);
 
     assertions = [
       {
@@ -666,10 +536,6 @@ in
           -> (ps.forgeTokenFile != null || cfg.forgeTokenFile != null)
         ) cfg.packageSets;
         message = "services.bumpkin.forgeTokenFile must be set (globally or per packageSet) when actions.pr is enabled (needed for forge API).";
-      }
-      {
-        assertion = lib.all (ps: ps.forge != "api" || ps.forgeApiUrl != null) cfg.packageSets;
-        message = "Each packageSet with forge = \"api\" must set forgeApiUrl.";
       }
       (let
         paths = map (ps: if ps.path != null then ps.path else defaultPath ps) cfg.packageSets;

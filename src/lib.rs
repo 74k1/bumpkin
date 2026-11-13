@@ -1,338 +1,212 @@
-pub(crate) mod forge;
+// Logs go to stderr; stdout is reserved for data (`list`, `list --json`).
+macro_rules! log {
+    ($level:literal, $($arg:tt)*) => { eprintln!("{:>5} {}", $level, format!($($arg)*)) };
+}
+macro_rules! info { ($($arg:tt)*) => { log!("INFO", $($arg)*) }; }
+macro_rules! warn { ($($arg:tt)*) => { log!("WARN", $($arg)*) }; }
+macro_rules! error { ($($arg:tt)*) => { log!("ERROR", $($arg)*) }; }
+macro_rules! debug { ($($arg:tt)*) => { if crate::verbose() { log!("DEBUG", $($arg)*) } }; }
+
+mod forge;
 mod git;
 mod nix;
-pub(crate) mod packages;
-pub(crate) mod repology;
 mod update;
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
-use clap::{Parser, Subcommand};
+static VERBOSE: AtomicBool = AtomicBool::new(false);
 
-#[derive(Parser)]
-#[command(
-    name = "bumpkin",
-    about = "Small Rust updater/PR steward for Nix flake package sets",
-    version
-)]
-pub struct Cli {
-    /// Root path of the flake repository
-    #[arg(
-        short = 'C',
-        long = "root",
-        global = true,
-        default_value = ".",
-        value_name = "PATH"
-    )]
+pub(crate) fn verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
+
+const HELP: &str = "\
+Small Rust updater/PR steward for Nix flake package sets
+
+Usage: bumpkin [OPTIONS] <COMMAND>
+
+Commands:
+  list               List packages maintained by --maintainer
+  dry-run            Update + build in a temp worktree; the checkout is not touched
+  run-update-script  Run the updater for --package and exit
+  update             Update --package (in place) or all packages of --maintainer
+
+Options:
+  -C, --root <PATH>          Root of the flake repository [default: .]
+  -p, --package <ATTR>       Single package
+  -m, --maintainer <NAME>    Maintainer handle
+  -v, --verbose              Show internal steps and diffs
+      --json                 list: output JSON
+      --skip <A,B>           Packages to skip (also: BUMPKIN_SKIP env var)
+      --no-build [<A,B>]     Packages to update without building (no value: all)
+      --commit               Commit (batch mode: on per-package branches)
+      --signed               Sign commits (git commit -S)
+      --push                 Push per-package branches to origin (needs --commit)
+      --pr                   Open pull requests (needs --push)
+      --signing-key <KEY>    Git user.signingkey for the commit
+      --gpg-format <FORMAT>  Git gpg.format for the commit (openpgp or ssh)
+      --forge <FORGE>        auto, github-cli, github-api, or api [default: auto]
+      --forge-api-url <URL>  REST API base URL (default: derived from origin)
+      --branch-prefix <P>    Per-package branch prefix [default: bumpkin/]
+  -h, --help                 Print help
+  -V, --version              Print version";
+
+#[derive(Debug, Default)]
+pub struct Args {
+    pub command: String,
     pub root: PathBuf,
-
-    /// Show detailed output (internal steps, diffs, etc.)
-    #[arg(short = 'v', long = "verbose", global = true)]
     pub verbose: bool,
-
-    #[command(subcommand)]
-    pub command: Command,
+    pub json: bool,
+    pub package: Option<String>,
+    pub maintainer: Option<String>,
+    pub commit: bool,
+    pub signed: bool,
+    pub push: bool,
+    pub pr: bool,
+    pub skip: Vec<String>,
+    /// Packages to update without building; `*` means all.
+    pub no_build: Vec<String>,
+    pub signing_key: Option<String>,
+    pub gpg_format: Option<String>,
+    pub forge: String,
+    pub forge_api_url: Option<String>,
+    /// Per-package branches are named `{branch_prefix}{package}`.
+    pub branch_prefix: String,
 }
 
-#[derive(Subcommand)]
-pub enum Command {
-    /// List packages maintained by a maintainer
-    List {
-        /// Maintainer handle (e.g., github username)
-        #[arg(short = 'm', long = "maintainer")]
-        maintainer: Option<String>,
-
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Dry-run: show what would change without mutating the repo
-    DryRun {
-        /// Single package to check
-        #[arg(short = 'p', long = "package")]
-        package: Option<String>,
-
-        /// Maintainer whose packages to check
-        #[arg(short = 'm', long = "maintainer")]
-        maintainer: Option<String>,
-
-        /// Comma-separated package names to skip
-        #[arg(long, value_delimiter = ',')]
-        skip: Vec<String>,
-    },
-
-    /// Run a package's updateScript directly and exit
-    RunUpdateScript {
-        /// Package attribute name
-        #[arg(short = 'p', long = "package")]
-        package: String,
-    },
-
-    /// Update packages to latest versions
-    Update {
-        /// Single package to update
-        #[arg(short = 'p', long = "package")]
-        package: Option<String>,
-
-        /// Maintainer whose packages to update
-        #[arg(short = 'm', long = "maintainer")]
-        maintainer: Option<String>,
-
-        /// Create a per-package commit on a dedicated branch
-        #[arg(long)]
-        commit: bool,
-
-        /// Sign commits with GPG or SSH
-        #[arg(long)]
-        signed: bool,
-
-        /// Push per-package branches to origin
-        #[arg(long)]
-        push: bool,
-
-        /// Create pull requests for pushed branches
-        #[arg(long)]
-        pr: bool,
-
-        /// Comma-separated package names to skip
-        #[arg(long, value_delimiter = ',')]
-        skip: Vec<String>,
-
-        /// Comma-separated packages to skip building (still update version/hash)
-        #[arg(long = "no-build", value_delimiter = ',')]
-        no_build: Vec<String>,
-
-        /// GPG/SSH signing key identifier
-        #[arg(long = "signing-key")]
-        signing_key: Option<String>,
-
-        /// Git gpg.format value (openpgp or ssh)
-        #[arg(long = "gpg-format")]
-        gpg_format: Option<String>,
-
-        /// Forge backend: auto, github-cli, github-api, or api
-        #[arg(long)]
-        forge: Option<String>,
-
-        /// API base URL when forge is api
-        #[arg(long = "forge-api-url")]
-        forge_api_url: Option<String>,
-
-        /// Prefix for per-package branch names [default: bumpkin/]
-        #[arg(long = "branch-prefix", value_name = "PREFIX")]
-        branch_prefix: Option<String>,
-    },
-}
-
-pub use config::Config;
-
-/// Load the first config file found (.bumpkin.nix, XDG, /var/bumpkin).
-/// Called by main before tracing is initialized, so `verbose = true` in the
-/// config can take effect.
-pub fn load_config() -> Result<Config, String> {
-    config::load_first().map(Option::unwrap_or_default)
-}
-
-pub fn run(cli: Cli, c: Config) -> Result<(), String> {
-    let root = if cli.root.as_os_str() != "." {
-        cli.root
-    } else {
-        c.root
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
+pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
+    let list = |v: String| v.split(',').map(str::to_string).collect::<Vec<_>>();
+    let mut a = Args {
+        root: ".".into(),
+        forge: "auto".into(),
+        branch_prefix: "bumpkin/".into(),
+        ..Default::default()
     };
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_string())),
+            _ => (arg.as_str(), None),
+        };
+        let mut optional = || inline.clone().or_else(|| args.next_if(|v| !v.starts_with('-')));
+        let mut value = || optional().ok_or(format!("{flag} needs a value"));
+        match flag {
+            "-C" | "--root" => a.root = value()?.into(),
+            "-p" | "--package" => a.package = Some(value()?),
+            "-m" | "--maintainer" => a.maintainer = Some(value()?),
+            "-v" | "--verbose" => a.verbose = true,
+            "--json" => a.json = true,
+            "--skip" => a.skip = list(value()?),
+            "--no-build" => a.no_build = list(optional().unwrap_or("*".into())),
+            "--commit" => a.commit = true,
+            "--signed" => a.signed = true,
+            "--push" => a.push = true,
+            "--pr" => a.pr = true,
+            "--signing-key" => a.signing_key = Some(value()?),
+            "--gpg-format" => a.gpg_format = Some(value()?),
+            "--forge" => a.forge = value()?,
+            "--forge-api-url" => a.forge_api_url = Some(value()?),
+            "--branch-prefix" => a.branch_prefix = value()?,
+            "-h" | "--help" => {
+                println!("{HELP}");
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("bumpkin {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            command if !command.starts_with('-') && a.command.is_empty() => {
+                a.command = command.to_string()
+            }
+            other => return Err(format!("unexpected argument `{other}` (see --help)")),
+        }
+    }
+    Ok(a)
+}
 
-    match cli.command {
-        Command::List { maintainer, json } => {
-            let m = maintainer
-                .or(c.maintainer)
-                .ok_or("list needs --maintainer <name>")?;
-            let candidates = packages::by_maintainer(&root, &m)?;
-            if json {
-                print_candidates_json(&candidates);
+pub fn run(mut a: Args) -> Result<(), String> {
+    VERBOSE.store(a.verbose, Ordering::Relaxed);
+    a.skip.extend(update::env_skip());
+
+    match a.command.as_str() {
+        "list" => {
+            let maintainer = a.maintainer.ok_or("list needs --maintainer <name>")?;
+            let packages = nix::packages_by_maintainer(&a.root, &maintainer)?;
+            let rows: Vec<_> = packages
+                .iter()
+                .map(|p| {
+                    let backend = if p.has_update_script { "update-script" } else { "native" };
+                    (&p.attr_path, backend, p.file.as_ref().map(|f| f.display().to_string()))
+                })
+                .collect();
+            if a.json {
+                let objects: Vec<_> = rows
+                    .iter()
+                    .map(|(attr, backend, file)| {
+                        let file = file
+                            .as_deref()
+                            .map_or("null".to_string(), |f| format!("\"{}\"", json_escape(f)));
+                        format!(
+                            "  {{\"attr_path\":\"{}\",\"backend\":\"{backend}\",\"file\":{file}}}",
+                            json_escape(attr)
+                        )
+                    })
+                    .collect();
+                println!("[\n{}\n]", objects.join(",\n"));
             } else {
-                for candidate in candidates {
-                    println!(
-                        "{}\t{}\t{}",
-                        candidate.attr_path,
-                        candidate.backend.name(),
-                        display_file(candidate.file.as_deref())
-                    );
+                for (attr, backend, file) in rows {
+                    println!("{attr}\t{backend}\t{}", file.as_deref().unwrap_or("unknown"));
                 }
             }
             Ok(())
         }
 
-        Command::DryRun {
-            package,
-            maintainer,
-            skip,
-        } => {
-            let pkg = package.or(c.package);
-            let mnt = maintainer.or(c.maintainer);
-            let mut skip = if skip.is_empty() {
-                c.skip.unwrap_or_default()
-            } else {
-                skip
-            };
-            skip.extend(update::env_skip());
-
-            if let Some(p) = pkg.as_deref() {
-                update::dry_run_package(&root, p)
-            } else if let Some(m) = mnt.as_deref() {
-                let candidates: Vec<_> = packages::by_maintainer(&root, m)?
-                    .into_iter()
-                    .filter(|cand| !skip.contains(&cand.attr_path))
-                    .collect();
-                if candidates.is_empty() {
-                    tracing::info!("No packages found for maintainer `{m}`.");
-                }
-                for candidate in candidates {
-                    if candidate.backend.is_runnable() || candidate.backend.is_native_candidate() {
-                        if let Err(err) = update::dry_run_package(&root, &candidate.attr_path) {
-                            tracing::error!(package = %candidate.attr_path, "{err}");
-                        }
-                    } else {
-                        tracing::debug!(
-                            package = %candidate.attr_path,
-                            backend = %candidate.backend.name(),
-                            file = %display_file(candidate.file.as_deref()),
-                            "{}",
-                            candidate.backend.note()
-                        );
-                    }
-                }
-                Ok(())
-            } else {
-                Err("dry-run needs --package <attr> or --maintainer <name>".to_string())
-            }
+        "run-update-script" => {
+            let package = a.package.ok_or("run-update-script needs --package <attr>")?;
+            update::run_update_script(&a.root, &package)
         }
 
-        Command::RunUpdateScript { package } => update::run_update_script_direct(&root, &package),
-
-        Command::Update {
-            package,
-            maintainer,
-            commit,
-            signed,
-            push,
-            pr,
-            skip,
-            no_build,
-            signing_key,
-            gpg_format,
-            forge,
-            forge_api_url,
-            branch_prefix,
-        } => {
-            let pkg = package.or(c.package);
-            let mnt = maintainer.or(c.maintainer);
-            let commit = commit || c.commit.unwrap_or(false);
-            let signed = signed || c.signed.unwrap_or(false);
-            let push = push || c.push.unwrap_or(false);
-            let pr = pr || c.pr.unwrap_or(false);
-            let skip = if skip.is_empty() {
-                c.skip.unwrap_or_default()
-            } else {
-                skip
-            };
-            let no_build = if no_build.is_empty() {
-                c.no_build.unwrap_or_default()
-            } else {
-                no_build
-            };
-            let signing_key = signing_key.or(c.signing_key);
-            let gpg_format = gpg_format.or(c.gpg_format);
-            let forge = forge.or(c.forge);
-            let forge_api_url = forge_api_url.or(c.forge_api_url);
-            let branch_prefix = branch_prefix
-                .or(c.branch_prefix)
-                .unwrap_or_else(|| "bumpkin/".to_string());
-
+        "dry-run" | "update" => {
             // These imply each other; catch misuse instead of silently ignoring flags.
-            if push && !commit {
+            if a.push && !a.commit {
                 return Err("--push requires --commit".to_string());
             }
-            if pr && !push {
+            if a.pr && !a.push {
                 return Err("--pr requires --push".to_string());
             }
             // Leftover branches are force-deleted before each run, so an empty
             // prefix could delete an unrelated branch named like a package.
-            if branch_prefix.is_empty() {
+            if a.branch_prefix.is_empty() {
                 return Err("--branch-prefix must not be empty".to_string());
             }
+            let dry = a.command == "dry-run";
+            if dry && a.commit {
+                return Err("dry-run does not take --commit".to_string());
+            }
 
-            if let Some(p) = pkg.as_deref() {
-                update::update_package(
-                    &root,
-                    p,
-                    update::CommitOptions {
-                        commit,
-                        signed,
-                        push,
-                        pr,
-                        signing_key,
-                        gpg_format,
-                        forge: forge.unwrap_or_else(|| "auto".to_string()),
-                        forge_api_url,
-                        no_build,
-                        branch_prefix,
-                    },
-                )
-            } else if let Some(m) = mnt.as_deref() {
-                update::update_maintainer(
-                    &root,
-                    m,
-                    &update::CommitOptions {
-                        commit,
-                        signed,
-                        push,
-                        pr,
-                        signing_key,
-                        gpg_format,
-                        forge: forge.unwrap_or_else(|| "auto".to_string()),
-                        forge_api_url,
-                        no_build,
-                        branch_prefix,
-                    },
-                    &skip,
-                )
+            if let Some(package) = a.package.as_deref() {
+                if dry {
+                    update::dry_run_package(&a.root, package)
+                } else {
+                    update::update_package(&a.root, package, &a)
+                }
+            } else if let Some(maintainer) = a.maintainer.as_deref() {
+                // Without --commit this runs in temp worktrees, i.e. a dry run.
+                update::update_maintainer(&a.root, maintainer, &a)
             } else {
-                Err("update needs --package <attr> or --maintainer <name>".to_string())
+                Err(format!("{} needs --package <attr> or --maintainer <name>", a.command))
             }
         }
+
+        "" => Err("missing command (see --help)".to_string()),
+        other => Err(format!("unknown command `{other}` (see --help)")),
     }
 }
 
-fn display_file(file: Option<&std::path::Path>) -> String {
-    file.map(|file| file.display().to_string())
-        .unwrap_or_else(|| "evaluated".to_string())
-}
-
-fn print_candidates_json(candidates: &[packages::Candidate]) {
-    println!("[");
-    for (index, candidate) in candidates.iter().enumerate() {
-        let comma = if index + 1 == candidates.len() {
-            ""
-        } else {
-            ","
-        };
-        println!(
-            "  {{\"attr_path\":\"{}\",\"backend\":\"{}\",\"file\":{}}}{comma}",
-            json_escape(&candidate.attr_path),
-            json_escape(candidate.backend.name()),
-            candidate
-                .file
-                .as_deref()
-                .map(|file| format!("\"{}\"", json_escape(&file.display().to_string())))
-                .unwrap_or_else(|| "null".to_string())
-        );
-    }
-    println!("]");
-}
-
-fn json_escape(value: &str) -> String {
+pub(crate) fn json_escape(value: &str) -> String {
     let mut out = String::new();
     for ch in value.chars() {
         match ch {
@@ -348,221 +222,42 @@ fn json_escape(value: &str) -> String {
     out
 }
 
-mod config {
-    use std::{
-        env,
-        path::{Path, PathBuf},
-    };
-
-    #[derive(Debug, Default)]
-    pub struct Config {
-        pub root: Option<String>,
-        pub maintainer: Option<String>,
-        pub package: Option<String>,
-        pub commit: Option<bool>,
-        pub signed: Option<bool>,
-        pub push: Option<bool>,
-        pub pr: Option<bool>,
-        pub skip: Option<Vec<String>>,
-        pub signing_key: Option<String>,
-        pub gpg_format: Option<String>,
-        pub forge: Option<String>,
-        pub forge_api_url: Option<String>,
-        pub no_build: Option<Vec<String>>,
-        pub branch_prefix: Option<String>,
-        pub verbose: Option<bool>,
-    }
-
-    pub fn load_first() -> Result<Option<Config>, String> {
-        for path in search_paths()? {
-            if path.exists() {
-                return load_from_path(&path).map(Some);
-            }
-        }
-        Ok(None)
-    }
-
-    fn search_paths() -> Result<Vec<PathBuf>, String> {
-        let cwd = env::current_dir().map_err(|e| format!("current dir: {e}"))?;
-        let mut paths = vec![cwd.join(".bumpkin.nix")];
-
-        if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-            paths.push(PathBuf::from(xdg).join("bumpkin").join("config.nix"));
-        } else if let Some(home) = env::var_os("HOME") {
-            paths.push(
-                PathBuf::from(home)
-                    .join(".config")
-                    .join("bumpkin")
-                    .join("config.nix"),
-            );
-        }
-
-        paths.push(PathBuf::from("/var/bumpkin/config.nix"));
-        Ok(paths)
-    }
-
-    fn load_from_path(path: &Path) -> Result<Config, String> {
-        let dir = path
-            .parent()
-            .ok_or_else(|| format!("config path has no parent: {}", path.display()))?;
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("config path is not valid UTF-8: {}", path.display()))?;
-
-        let expr = config_expr(file_name);
-
-        let out = crate::nix::nix_cmd()
-            .args(["eval", "--raw", "--impure", "--expr", &expr])
-            .current_dir(dir)
-            .output()
-            .map_err(|e| format!("eval {}: {e}", path.display()))?;
-        if !out.status.success() {
-            return Err(format!(
-                "eval {} exited with {}\n{}",
-                path.display(),
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
-
-        parse_config_output(
-            &String::from_utf8(out.stdout).map_err(|e| format!("decode config: {e}"))?,
-        )
-    }
-
-    fn config_expr(file_name: &str) -> String {
-        format!(
-            r#"
-let
-  cfg = import ./{file_name};
-  string = name:
-    if builtins.hasAttr name cfg then
-      let value = cfg.${{name}}; in if value == null then "" else builtins.toString value
-    else "";
-  list = name:
-    if builtins.hasAttr name cfg then
-      let value = cfg.${{name}}; in if value == null then "" else builtins.concatStringsSep "," (map builtins.toString value)
-    else "";
-  bool = name:
-    if builtins.hasAttr name cfg then
-      let value = cfg.${{name}}; in if value == null then "" else if value then "1" else "0"
-    else "";
-  line = name: value: name + "\t" + value;
-in builtins.concatStringsSep "\n" [
-  (line "root" (string "root"))
-  (line "maintainer" (string "maintainer"))
-  (line "package" (string "package"))
-  (line "commit" (bool "commit"))
-  (line "signed" (bool "signed"))
-  (line "push" (bool "push"))
-  (line "pr" (bool "pr"))
-  (line "signing_key" (string "signingKey"))
-  (line "gpg_format" (string "gpgFormat"))
-  (line "forge" (string "forge"))
-  (line "forge_api_url" (string "forgeApiUrl"))
-  (line "no_build" (list "noBuild"))
-  (line "skip" (list "skip"))
-  (line "branch_prefix" (string "branchPrefix"))
-  (line "verbose" (bool "verbose"))
-]
-"#,
-            file_name = escape_nix_path_segment(file_name)
-        )
-    }
-
-    fn parse_config_output(stdout: &str) -> Result<Config, String> {
-        let mut config = Config::default();
-        for line in stdout.lines() {
-            let Some((key, value)) = line.split_once('\t') else {
-                continue;
-            };
-            if value.is_empty() {
-                continue;
-            }
-            match key {
-                "root" => config.root = Some(value.to_string()),
-                "maintainer" => config.maintainer = Some(value.to_string()),
-                "package" => config.package = Some(value.to_string()),
-                "commit" => config.commit = Some(value == "1"),
-                "signed" => config.signed = Some(value == "1"),
-                "push" => config.push = Some(value == "1"),
-                "pr" => config.pr = Some(value == "1"),
-                "signing_key" => config.signing_key = Some(value.to_string()),
-                "gpg_format" => config.gpg_format = Some(value.to_string()),
-                "forge" => config.forge = Some(value.to_string()),
-                "forge_api_url" => config.forge_api_url = Some(value.to_string()),
-                "no_build" => {
-                    config.no_build = Some(value.split(",").map(|s| s.to_string()).collect());
-                }
-                "skip" => {
-                    config.skip = Some(value.split(",").map(|s| s.to_string()).collect());
-                }
-                "branch_prefix" => config.branch_prefix = Some(value.to_string()),
-                "verbose" => config.verbose = Some(value == "1"),
-                _ => {}
-            }
-        }
-
-        Ok(config)
-    }
-
-    fn escape_nix_path_segment(value: &str) -> String {
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn cli_list_parses() {
-        let cli = Cli::try_parse_from(["bumpkin", "list", "--maintainer", "74k1"]).unwrap();
-        assert!(matches!(cli.command, Command::List { .. }));
+    fn parse_ok(args: &[&str]) -> Args {
+        parse(args.iter().map(|s| s.to_string())).unwrap()
     }
 
     #[test]
-    fn cli_dry_run_package() {
-        let cli = Cli::try_parse_from(["bumpkin", "dry-run", "-p", "foo"]).unwrap();
-        assert!(matches!(cli.command, Command::DryRun { .. }));
+    fn parses_commands_and_flags() {
+        let a = parse_ok(&["-C", "/tmp/flake", "-v", "list", "-m", "x", "--json"]);
+        assert_eq!((a.command.as_str(), a.verbose, a.json), ("list", true, true));
+        assert_eq!(a.root, PathBuf::from("/tmp/flake"));
+        assert_eq!(a.maintainer.as_deref(), Some("x"));
+
+        let a = parse_ok(&["update", "-p", "foo", "--commit", "--signed", "--push", "--pr"]);
+        assert!(a.commit && a.signed && a.push && a.pr);
+        assert_eq!((a.forge.as_str(), a.branch_prefix.as_str()), ("auto", "bumpkin/"));
     }
 
     #[test]
-    fn cli_update_with_commit() {
-        let cli = Cli::try_parse_from([
-            "bumpkin", "update", "-m", "74k1", "--commit", "--signed", "--push", "--pr",
-        ])
-        .unwrap();
-        assert!(matches!(cli.command, Command::Update { .. }));
+    fn parses_values_lists_and_bare_no_build() {
+        let a = parse_ok(&["update", "--branch-prefix=upkeep/", "--skip", "a,b", "--no-build", "c"]);
+        assert_eq!(a.branch_prefix, "upkeep/");
+        assert_eq!((a.skip, a.no_build), (vec!["a".to_string(), "b".into()], vec!["c".to_string()]));
+
+        let a = parse_ok(&["update", "--no-build", "--commit"]);
+        assert_eq!(a.no_build, vec!["*".to_string()]);
+        assert!(a.commit);
     }
 
     #[test]
-    fn cli_update_branch_prefix() {
-        let cli = Cli::try_parse_from([
-            "bumpkin",
-            "update",
-            "-p",
-            "foo",
-            "--branch-prefix",
-            "upkeep/",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Update { branch_prefix: Some(ref p), .. } if p == "upkeep/"
-        ));
-    }
-
-    #[test]
-    fn cli_root_flag() {
-        let cli = Cli::try_parse_from(["bumpkin", "-C", "/tmp/flake", "list", "-m", "x"]).unwrap();
-        assert_eq!(cli.root, std::path::PathBuf::from("/tmp/flake"));
-    }
-
-    #[test]
-    fn cli_verbose_global() {
-        let cli = Cli::try_parse_from(["bumpkin", "-v", "list", "-m", "x"]).unwrap();
-        assert!(cli.verbose);
+    fn rejects_unknown_and_missing_values() {
+        let parse_err = |args: &[&str]| parse(args.iter().map(|s| s.to_string())).is_err();
+        assert!(parse_err(&["update", "--nope"]));
+        assert!(parse_err(&["update", "--package"]));
+        assert!(parse_err(&["update", "extra"]));
     }
 }

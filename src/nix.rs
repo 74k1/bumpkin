@@ -1,6 +1,7 @@
-use std::{path::Path, process::Command};
-
-use crate::git;
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 pub(crate) fn nix_cmd() -> Command {
     let mut cmd = Command::new("nix");
@@ -9,207 +10,121 @@ pub(crate) fn nix_cmd() -> Command {
 }
 
 #[derive(Debug)]
-pub struct EvaluatedPackage {
+pub struct Package {
     pub attr_path: String,
-    pub position: Option<String>,
+    /// Package file inside the checkout (from `meta.position`), if known.
+    pub file: Option<PathBuf>,
     pub has_update_script: bool,
 }
 
-pub fn package_version(root: &Path, package: &str) -> Result<String, String> {
-    let out = nix_cmd()
-        .args([
-            "eval",
-            "--raw",
-            &format!("path:{}#{package}.version", root.display()),
-        ])
-        .output()
-        .map_err(|e| format!("eval package version: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
-    }
-    String::from_utf8(out.stdout)
-        .map(|s| s.trim().to_string())
-        .map_err(|e| format!("decode package version: {e}"))
-}
-
-/// `UPDATE_NIX_*` environment for updateScripts, matching what nixpkgs'
-/// `maintainers/scripts/update.py` sets (nix-update reads the attr path from it).
-pub fn update_script_env(root: &Path, package: &str) -> Vec<(&'static str, String)> {
-    let mut env = vec![("UPDATE_NIX_ATTR_PATH", package.to_string())];
-    let out = nix_cmd()
-        .args([
-            "eval",
-            "--raw",
-            &format!("path:{}#{package}", root.display()),
-            "--apply",
-            r#"p: builtins.concatStringsSep "\t" [ (p.name or "") (p.pname or "") (p.version or "") ]"#,
-        ])
-        .output();
-    match out {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let mut fields = stdout.trim_end().splitn(3, '\t');
-            for key in [
-                "UPDATE_NIX_NAME",
-                "UPDATE_NIX_PNAME",
-                "UPDATE_NIX_OLD_VERSION",
-            ] {
-                if let Some(value) = fields.next().filter(|value| !value.is_empty()) {
-                    env.push((key, value.to_string()));
-                }
-            }
-        }
-        Ok(out) => tracing::debug!(
-            "{package}: eval updateScript env failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        ),
-        Err(e) => tracing::debug!("{package}: eval updateScript env: {e}"),
-    }
-    env
-}
-
-pub fn build_package(root: &Path, package: &str) -> Result<bool, String> {
-    git::status(nix_cmd().args([
-        "build",
-        "--no-link",
-        &format!("path:{}#{package}", root.display()),
-    ]))
-}
-
-/// Build and capture full output (for diagnostics in PR bodies).
-pub fn build_package_with_log(root: &Path, package: &str) -> Result<(bool, String), String> {
-    let out = nix_cmd()
-        .args([
-            "build",
-            "--no-link",
-            &format!("path:{}#{package}", root.display()),
-        ])
-        .output()
-        .map_err(|e| format!("run nix build: {e}"))?;
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    Ok((out.status.success(), format!("{stdout}{stderr}")))
-}
-
-/// Collect key flake metadata for PR bodies: nixpkgs input name and rev.
-pub fn flake_input_info(root: &Path) -> Result<(String, String), String> {
-    if !root.join("flake.nix").exists() {
-        return Ok((String::new(), String::new()));
-    }
-    let root = root
-        .canonicalize()
-        .map_err(|e| format!("canonicalize {}: {e}", root.display()))?;
-    let expr = flake_input_info_expr(&format!("path:{}", root.display()));
-    let out = nix_cmd()
-        .args(["eval", "--raw", "--impure", "--expr", &expr])
-        .current_dir(&root)
-        .output()
-        .map_err(|e| format!("eval flake input info: {e}"))?;
-    if !out.status.success() {
-        return Ok((String::new(), String::new()));
-    }
-    let stdout =
-        String::from_utf8(out.stdout).map_err(|e| format!("decode flake input info: {e}"))?;
-    let mut input = String::new();
-    let mut rev = String::new();
-    for line in stdout.lines() {
-        if let Some(r) = line.strip_prefix("input\t") {
-            input = r.to_string();
-        } else if let Some(r) = line.strip_prefix("rev\t") {
-            rev = r.to_string();
-        }
-    }
-    Ok((input, rev))
-}
-
-/// Evaluated source info for a package, straight from Nix instead of
-/// scraping the .nix file: where the source actually lives.
+/// Evaluated facts about one package, straight from Nix instead of scraping
+/// the .nix file: where it is defined and where its source lives.
 #[derive(Debug, Default)]
-pub struct SrcInfo {
+pub struct PackageInfo {
+    pub file: Option<PathBuf>,
+    pub name: String,
+    pub pname: String,
+    pub version: String,
     /// `src.gitRepoUrl` (set by fetchFromGitHub and friends), if any.
     pub git_repo_url: String,
     /// `src.urls` (or `[src.url]`) of the source derivation.
     pub urls: Vec<String>,
 }
 
-pub fn src_info(root: &Path, package: &str) -> Result<SrcInfo, String> {
+fn installable(root: &Path, package: &str) -> String {
+    format!("path:{}#{package}", root.display())
+}
+
+/// `path:` flake ref of a checkout, for `builtins.getFlake`.
+fn flake_ref(root: &Path) -> Result<String, String> {
     if !root.join("flake.nix").exists() {
         return Err("expected a flake root containing flake.nix".to_string());
     }
     let root = root
         .canonicalize()
         .map_err(|e| format!("canonicalize {}: {e}", root.display()))?;
-    let expr = src_info_expr(&format!("path:{}", root.display()), package);
+    Ok(escape_nix_string(&format!("path:{}", root.display())))
+}
+
+fn eval(expr: &str) -> Result<String, String> {
     let out = nix_cmd()
-        .args(["eval", "--raw", "--impure", "--expr", &expr])
-        .current_dir(&root)
+        .args(["eval", "--raw", "--impure", "--expr", expr])
         .output()
-        .map_err(|e| format!("eval src info: {e}"))?;
+        .map_err(|e| format!("nix eval: {e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "eval src info failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
     }
-    let stdout = String::from_utf8(out.stdout).map_err(|e| format!("decode src info: {e}"))?;
-    let mut info = SrcInfo::default();
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix("gitRepoUrl\t") {
-            info.git_repo_url = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("url\t")
-            && !rest.is_empty()
-        {
-            info.urls.push(rest.to_string());
+    String::from_utf8(out.stdout).map_err(|e| format!("decode nix eval output: {e}"))
+}
+
+/// Map a flake-relative `file:line` position to a file in the checkout.
+fn checkout_file(root: &Path, position: &str) -> Option<PathBuf> {
+    let file = root.join(position.rsplit_once(':')?.0);
+    file.exists().then_some(file)
+}
+
+pub fn package_version(root: &Path, package: &str) -> String {
+    let out = nix_cmd()
+        .args(["eval", "--raw", &format!("{}.version", installable(root, package))])
+        .output();
+    match out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+pub fn build_package(root: &Path, package: &str) -> Result<bool, String> {
+    nix_cmd()
+        .args(["build", "--no-link", &installable(root, package)])
+        .status()
+        .map(|s| s.success())
+        .map_err(|e| format!("run nix build: {e}"))
+}
+
+/// Build and capture the full output (hash mismatches, PR body diagnostics).
+pub fn build_package_with_log(root: &Path, package: &str) -> Result<(bool, String), String> {
+    let out = nix_cmd()
+        .args(["build", "--no-link", &installable(root, package)])
+        .output()
+        .map_err(|e| format!("run nix build: {e}"))?;
+    let log = [out.stdout, out.stderr].concat();
+    Ok((out.status.success(), String::from_utf8_lossy(&log).into_owned()))
+}
+
+/// nixpkgs input name and rev for PR bodies; empty strings where unknown.
+pub fn flake_input_info(root: &Path) -> (String, String) {
+    let stdout = flake_ref(root)
+        .and_then(|flake| eval(&flake_input_info_expr(&flake)))
+        .unwrap_or_default();
+    let field = |key: &str| {
+        let value = stdout.lines().find_map(|line| line.strip_prefix(key));
+        value.unwrap_or_default().to_string()
+    };
+    (field("input\t"), field("rev\t"))
+}
+
+pub fn package_info(root: &Path, package: &str) -> Result<PackageInfo, String> {
+    let stdout = eval(&package_info_expr(&flake_ref(root)?, package))
+        .map_err(|e| format!("eval package info failed:\n{e}"))?;
+    let mut info = PackageInfo::default();
+    for (key, value) in stdout.lines().filter_map(|line| line.split_once('\t')) {
+        match key {
+            "file" => info.file = checkout_file(root, value),
+            "name" => info.name = value.to_string(),
+            "pname" => info.pname = value.to_string(),
+            "version" => info.version = value.to_string(),
+            "gitRepoUrl" => info.git_repo_url = value.to_string(),
+            "url" if !value.is_empty() => info.urls.push(value.to_string()),
+            _ => {}
         }
     }
     Ok(info)
 }
 
-fn src_info_expr(flake_ref: &str, package: &str) -> String {
-    format!(
-        r#"
-let
-  flake = builtins.getFlake "{flake_ref}";
-  system = builtins.currentSystem;
-  flakePackages = flake.packages.${{system}} or {{}};
-  legacyPackages = flake.legacyPackages.${{system}} or {{}};
-  package = flakePackages."{package}" or legacyPackages."{package}" or (throw "package `{package}` not found");
-  src = package.src or null;
-  str = value: let r = builtins.tryEval (builtins.toString value); in if r.success then r.value else "";
-  gitRepoUrl = if src == null then "" else str (src.gitRepoUrl or "");
-  urls =
-    let r = builtins.tryEval (
-      if src == null then []
-      else if src ? urls then map builtins.toString src.urls
-      else if src ? url then [ (builtins.toString src.url) ]
-      else []);
-    in if r.success then r.value else [];
-in builtins.concatStringsSep "\n" ([ ("gitRepoUrl\t" + gitRepoUrl) ] ++ map (u: "url\t" + u) urls)
-"#,
-        flake_ref = escape_nix_string(flake_ref),
-        package = escape_nix_string(package)
-    )
-}
-
 pub fn build_update_script(root: &Path, package: &str) -> Result<String, String> {
-    if !root.join("flake.nix").exists() {
-        return Err("expected a flake root containing flake.nix".to_string());
-    }
-
-    let root = root
-        .canonicalize()
-        .map_err(|e| format!("canonicalize {}: {e}", root.display()))?;
-    let expr = update_script_expr(&format!("path:{}", root.display()), package);
+    let expr = update_script_expr(&flake_ref(root)?, package);
     let out = nix_cmd()
-        .args([
-            "build",
-            "--no-link",
-            "--print-out-paths",
-            "--impure",
-            "--expr",
-            &expr,
-        ])
-        .current_dir(&root)
+        .args(["build", "--no-link", "--print-out-paths", "--impure", "--expr", &expr])
         .output()
         .map_err(|e| format!("build updateScript: {e}"))?;
     if !out.status.success() {
@@ -222,47 +137,64 @@ pub fn build_update_script(root: &Path, package: &str) -> Result<String, String>
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-pub fn packages_by_maintainer(
-    root: &Path,
-    maintainer: &str,
-) -> Result<Vec<EvaluatedPackage>, String> {
-    if !root.join("flake.nix").exists() {
-        return Err("expected a flake root containing flake.nix".to_string());
-    }
-
-    let root = root
-        .canonicalize()
-        .map_err(|e| format!("canonicalize {}: {e}", root.display()))?;
-    let expr = maintainer_query_expr(&format!("path:{}", root.display()), maintainer);
-    let out = nix_cmd()
-        .args(["eval", "--raw", "--impure", "--expr", &expr])
-        .current_dir(&root)
-        .output()
-        .map_err(|e| format!("eval maintainer query: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
-    }
-
-    let stdout =
-        String::from_utf8(out.stdout).map_err(|e| format!("decode maintainer query: {e}"))?;
+/// Packages whose `meta.maintainers` contain `maintainer`, sorted by name.
+pub fn packages_by_maintainer(root: &Path, maintainer: &str) -> Result<Vec<Package>, String> {
+    let stdout = eval(&maintainer_query_expr(&flake_ref(root)?, maintainer))?;
     let mut packages = Vec::new();
-    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+    for line in stdout.lines() {
         let mut fields = line.splitn(3, '\t');
         let attr_path = fields.next().unwrap_or_default().to_string();
-        let position = fields
-            .next()
-            .filter(|position| !position.is_empty())
-            .map(ToOwned::to_owned);
+        let file = fields.next().and_then(|position| checkout_file(root, position));
         let has_update_script = fields.next() == Some("1");
         if !attr_path.is_empty() {
-            packages.push(EvaluatedPackage {
-                attr_path,
-                position,
-                has_update_script,
-            });
+            packages.push(Package { attr_path, file, has_update_script });
         }
     }
     Ok(packages)
+}
+
+/// Shared bindings; expects `flake` in scope. Not passed through `format!`,
+/// so braces are literal here.
+const PRELUDE: &str = r#"
+  system = builtins.currentSystem;
+  flakePackages = flake.packages.${system} or {};
+  legacyPackages = flake.legacyPackages.${system} or {};
+  # `meta.position` relative to the flake root; "" when unknown or outside it.
+  relPosition = package:
+    let
+      r = builtins.tryEval (package.meta.position or "");
+      position = if r.success then r.value else "";
+      prefix = builtins.toString flake.outPath + "/";
+      n = builtins.stringLength prefix;
+    in if builtins.substring 0 n position == prefix then builtins.substring n (-1) position else "";
+"#;
+
+fn package_info_expr(flake_ref: &str, package: &str) -> String {
+    format!(
+        r#"
+let
+  flake = builtins.getFlake "{flake_ref}";
+  {PRELUDE}
+  package = flakePackages."{package}" or legacyPackages."{package}" or (throw "package `{package}` not found");
+  src = package.src or null;
+  str = value: let r = builtins.tryEval (builtins.toString value); in if r.success then r.value else "";
+  urls =
+    let r = builtins.tryEval (
+      if src == null then []
+      else if src ? urls then map builtins.toString src.urls
+      else if src ? url then [ (builtins.toString src.url) ]
+      else []);
+    in if r.success then r.value else [];
+in builtins.concatStringsSep "\n" ([
+  ("file\t" + relPosition package)
+  ("name\t" + str (package.name or ""))
+  ("pname\t" + str (package.pname or ""))
+  ("version\t" + str (package.version or ""))
+  ("gitRepoUrl\t" + (if src == null then "" else str (src.gitRepoUrl or "")))
+] ++ map (u: "url\t" + u) urls)
+"#,
+        package = escape_nix_string(package)
+    )
 }
 
 fn update_script_expr(flake_ref: &str, package: &str) -> String {
@@ -319,7 +251,6 @@ let
     else value;
 in normalize script
 "#,
-        flake_ref = escape_nix_string(flake_ref),
         package = escape_nix_string(package)
     )
 }
@@ -329,9 +260,7 @@ fn maintainer_query_expr(flake_ref: &str, maintainer: &str) -> String {
         r#"
 let
   flake = builtins.getFlake "{flake_ref}";
-  system = builtins.currentSystem;
-  flakePackages = flake.packages.${{system}} or {{}};
-  legacyPackages = flake.legacyPackages.${{system}} or {{}};
+  {PRELUDE}
   packages = legacyPackages // flakePackages;
   needle = "{maintainer}";
   altNeedle =
@@ -368,10 +297,6 @@ let
     );
     in result.success && result.value;
 
-  packagePosition = package:
-    let result = builtins.tryEval (package.meta.position or "");
-    in if result.success then result.value else "";
-
   packageHasUpdateScript = package:
     let result = builtins.tryEval (
       ((package ? passthru) && (package.passthru ? updateScript))
@@ -383,10 +308,9 @@ let
   matchingNames = builtins.filter (name: packageMatches packages.${{name}}) names;
   lineFor = name:
     let package = packages.${{name}};
-    in name + "\t" + packagePosition package + "\t" + (if packageHasUpdateScript package then "1" else "0");
+    in name + "\t" + relPosition package + "\t" + (if packageHasUpdateScript package then "1" else "0");
 in builtins.concatStringsSep "\n" (map lineFor matchingNames)
 "#,
-        flake_ref = escape_nix_string(flake_ref),
         maintainer = escape_nix_string(maintainer)
     )
 }
@@ -403,11 +327,8 @@ let
       in input ? rev && input ? outPath && (import input {{ system = builtins.currentSystem; }}).stdenv or null != null
     ) inputNames
   );
-  rev = if nixpkgsName != null then flake.inputs.${{nixpkgsName}}.rev or "" else "";
-in "input\t" + (if nixpkgsName != null then nixpkgsName else "")
-  + "\nrev\t" + rev
-"#,
-        flake_ref = escape_nix_string(flake_ref)
+in "input\t" + nixpkgsName + "\nrev\t" + (flake.inputs.${{nixpkgsName}}.rev or "")
+"#
     )
 }
 

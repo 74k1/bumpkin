@@ -13,32 +13,30 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Run git and return its trimmed stdout.
+fn output(root: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("run git {args:?}: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
 pub fn clean(root: &Path) -> Result<bool, String> {
     Ok(changed_paths(root)?.is_empty())
 }
 
 pub fn changed_paths(root: &Path) -> Result<Vec<String>, String> {
-    let out = Command::new("git")
-        .args(["status", "--porcelain=1", "--untracked-files=all"])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("git status: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
-    }
-
-    let mut paths = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        let path = &line[3..];
-        if let Some((_, to)) = path.split_once(" -> ") {
-            paths.push(to.to_string());
-        } else {
-            paths.push(path.to_string());
-        }
-    }
+    let status = output(root, &["status", "--porcelain=1", "--untracked-files=all"])?;
+    let mut paths: Vec<String> = status
+        .lines()
+        .filter(|line| line.len() >= 4)
+        .map(|line| line[3..].split_once(" -> ").map_or(&line[3..], |(_, to)| to).to_string())
+        .collect();
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -52,45 +50,44 @@ pub fn print_diff_stat(root: &Path) -> Result<(), String> {
     run(root, &["diff", "--stat", "--color=always"])
 }
 
+/// Commit `paths`. `config` entries are passed as one-off `git -c key=value`,
+/// so signing settings never end up in the repository's config.
 pub fn commit_paths(
     root: &Path,
     paths: &[String],
     title: &str,
     body: &str,
     signed: bool,
+    config: &[(&str, Option<&str>)],
 ) -> Result<(), String> {
     if paths.is_empty() {
         return Err("no paths to commit".to_string());
     }
+    let mut add = vec!["add", "--"];
+    add.extend(paths.iter().map(String::as_str));
+    run(root, &add)?;
 
-    let mut add = Command::new("git");
-    add.arg("add").arg("--").args(paths).current_dir(root);
-    let status = add.status().map_err(|e| format!("git add: {e}"))?;
-    if !status.success() {
-        return Err(format!("git add exited with {status}"));
-    }
-
+    let config: Vec<String> = config
+        .iter()
+        .filter_map(|(key, value)| value.map(|value| format!("{key}={value}")))
+        .collect();
+    let mut commit: Vec<&str> = config.iter().flat_map(|c| ["-c", c.as_str()]).collect();
+    commit.extend(["commit", "-m", title, "-m", body]);
     if signed {
-        run(root, &["commit", "-S", "-m", title, "-m", body])
-    } else {
-        run(root, &["commit", "-m", title, "-m", body])
+        commit.push("-S");
     }
+    run(root, &commit)
 }
 
 pub fn current_branch(root: &Path) -> Result<String, String> {
-    let out = Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("git branch --show-current: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    output(root, &["branch", "--show-current"])
 }
 
+/// Switch to `branch`, dropping whatever a failed update left behind. Commit
+/// mode starts from a clean tree, so anything dropped here is bumpkin's own.
 pub fn checkout_branch(root: &Path, branch: &str) -> Result<(), String> {
-    run(root, &["checkout", "-f", branch])
+    run(root, &["checkout", "-f", branch])?;
+    run(root, &["clean", "-fdq"])
 }
 
 pub fn create_branch(root: &Path, branch: &str) -> Result<(), String> {
@@ -101,12 +98,10 @@ pub fn delete_branch(root: &Path, branch: &str) -> Result<(), String> {
     run(root, &["branch", "-D", branch])
 }
 
-pub fn reset_hard(root: &Path, refspec: &str) -> Result<(), String> {
-    run(root, &["reset", "--hard", refspec])
-}
-
+/// Force-push: per-package branches are recreated from the main branch on
+/// every run, so an open PR's branch has to be overwritten to update it.
 pub fn push_branch(root: &Path, branch: &str) -> Result<(), String> {
-    run(root, &["push", "origin", branch])
+    run(root, &["push", "--force", "origin", branch])
 }
 
 pub fn pull_ff_only(root: &Path) -> Result<(), String> {
@@ -115,19 +110,10 @@ pub fn pull_ff_only(root: &Path) -> Result<(), String> {
 
 /// Get the fetch URL of the `origin` remote.
 pub fn remote_url(root: &Path) -> Result<String, String> {
-    let out = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("git remote get-url: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    output(root, &["remote", "get-url", "origin"])
 }
 
-pub fn status(cmd: &mut Command) -> Result<bool, String> {
-    cmd.status()
-        .map(|s| s.success())
-        .map_err(|e| format!("run command: {e}"))
+/// Whether `origin/<branch>` (as of the last fetch) already has the same tree.
+pub fn matches_remote(root: &Path, branch: &str) -> bool {
+    output(root, &["diff", "--quiet", &format!("origin/{branch}"), branch]).is_ok()
 }

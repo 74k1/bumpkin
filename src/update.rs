@@ -1,24 +1,25 @@
 use std::{
+    collections::{HashMap, HashSet},
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{forge, git, nix, packages, repology};
+use crate::{Args, forge, git, nix};
 
-pub struct CommitOptions {
-    pub commit: bool,
-    pub signed: bool,
-    pub push: bool,
-    pub pr: bool,
-    pub signing_key: Option<String>,
-    pub gpg_format: Option<String>,
-    pub forge: String,
-    pub forge_api_url: Option<String>,
-    pub no_build: Vec<String>,
-    /// Per-package branches are named `{branch_prefix}{package}`.
-    pub branch_prefix: String,
+// Per-package outcomes; also the labels of the batch summary.
+const NO_CHANGES: &str = "no changes";
+const BUILD_OK: &str = "updated, build ok";
+const BUILD_FAILED: &str = "updated, build failed";
+
+/// Error prefix for packages the native updater cannot handle (as opposed to
+/// an update that was attempted and failed); batch mode counts these as skipped.
+const UNSUPPORTED: &str = "unsupported: ";
+
+fn unsupported(reason: &str) -> String {
+    format!("{UNSUPPORTED}{reason}; add an updateScript")
 }
 
 /// Per-machine blocklist from the BUMPKIN_SKIP env var (comma-separated).
@@ -32,30 +33,12 @@ pub fn env_skip() -> Vec<String> {
         .collect()
 }
 
-pub fn dry_run_package(root: &Path, package: &str) -> Result<(), String> {
-    tracing::debug!("==> {package}");
-    let worktree = TempWorktree::create(root)?;
-    run_update_script(worktree.path(), package)?;
-
-    if git::clean(worktree.path())? {
-        tracing::info!("{package}: no changes");
-        return Ok(());
-    }
-
-    // git writes the diff straight to stdout, so gate it on the log level.
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        tracing::debug!("--- diffstat ---");
-        git::print_diff_stat(worktree.path())?;
-        tracing::debug!("--- diff ---");
-        git::print_diff(worktree.path())?;
-    }
-    tracing::debug!("--- build ---");
-    if nix::build_package(worktree.path(), package)? {
-        tracing::info!("{package}: build ok");
+fn log_outcome(package: &str, outcome: &str) {
+    if outcome == BUILD_FAILED {
+        warn!("{package}: {outcome}");
     } else {
-        tracing::error!("{package}: build failed");
+        info!("{package}: {outcome}");
     }
-    Ok(())
 }
 
 fn ensure_on_branch(branch: &str) -> Result<(), String> {
@@ -69,112 +52,105 @@ fn ensure_on_branch(branch: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn update_maintainer(
-    root: &Path,
-    maintainer: &str,
-    commit: &CommitOptions,
-    skip: &[String],
-) -> Result<(), String> {
-    let main_branch = git::current_branch(root)?;
+fn ensure_clean(root: &Path) -> Result<(), String> {
+    if !git::clean(root)? {
+        return Err(
+            "working tree has uncommitted or untracked changes; commit/stash them before update"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
 
-    if commit.commit {
+fn skip_build(a: &Args, package: &str) -> bool {
+    a.no_build.iter().any(|s| s == "*" || s == package)
+}
+
+fn commit(root: &Path, paths: &[String], title: &str, body: &str, a: &Args) -> Result<(), String> {
+    let config = [
+        ("gpg.format", a.gpg_format.as_deref()),
+        ("user.signingkey", a.signing_key.as_deref()),
+    ];
+    git::commit_paths(root, paths, title, body, a.signed, &config)
+}
+
+pub fn dry_run_package(root: &Path, package: &str) -> Result<(), String> {
+    log_outcome(package, worktree_update_one(root, package)?);
+    Ok(())
+}
+
+pub fn update_maintainer(root: &Path, maintainer: &str, a: &Args) -> Result<(), String> {
+    let main_branch = git::current_branch(root)?;
+    if a.commit {
         ensure_on_branch(&main_branch)?;
-        if !git::clean(root)? {
-            return Err(
-                "working tree has uncommitted or untracked changes; commit/stash them before update"
-                    .to_string(),
-            );
-        }
+        ensure_clean(root)?;
     }
 
-    let candidates = packages::by_maintainer(root, maintainer)?;
-    let env_skip = env_skip();
-    let candidates: Vec<_> = candidates
+    let packages: Vec<_> = nix::packages_by_maintainer(root, maintainer)?
         .into_iter()
-        .filter(|c| !skip.contains(&c.attr_path))
-        .filter(|c| !env_skip.contains(&c.attr_path))
+        .filter(|p| !a.skip.contains(&p.attr_path))
         .collect();
-    if candidates.is_empty() {
-        tracing::info!("No packages found for maintainer `{maintainer}`.");
+    if packages.is_empty() {
+        info!("No packages found for maintainer `{maintainer}`.");
         return Ok(());
     }
 
     // Ensure we're on the main branch and up to date at the start.
-    if commit.commit {
-        tracing::debug!("=== syncing main branch ===");
+    if a.commit {
         git::checkout_branch(root, &main_branch)?;
         git::pull_ff_only(root)?;
     }
 
-    let mut summary = BatchSummary::default();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
     // Track which source files were already updated this run to avoid duplicate
     // PRs for packages that share the same .nix file (e.g. waterfox + waterfox-unwrapped).
-    let mut updated_files: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    for candidate in candidates {
-        tracing::debug!("==> {} ({})", candidate.attr_path, candidate.backend.name());
-        if !(candidate.backend.is_runnable() || candidate.backend.is_native_candidate()) {
-            tracing::info!(
-                "{}: skipped ({})",
-                candidate.attr_path,
-                candidate.backend.note()
-            );
-            summary.skipped += 1;
-            continue;
-        }
-
-        if let Some(file) = candidate.file.as_deref()
-            && updated_files.contains(file)
-        {
-            tracing::debug!("skipped: source file already updated by a prior package in this run");
-            tracing::info!("{}: skipped (already updated)", candidate.attr_path);
-            summary.skipped += 1;
-            continue;
-        }
-
-        let outcome = if commit.commit {
-            // Per-package branch flow: branch -> update -> build -> commit -> push -> cleanup.
-            commit_update_one(root, &main_branch, &candidate.attr_path, commit)
+    let mut updated_files: HashSet<PathBuf> = HashSet::new();
+    for package in packages {
+        let name = &package.attr_path;
+        debug!("==> {name}");
+        let label = if package.file.as_ref().is_some_and(|f| updated_files.contains(f)) {
+            info!("{name}: skipped (source file already updated by a prior package)");
+            "skipped"
         } else {
-            // Temp worktree flow: no mutation of the checkout.
-            batch_update_one(root, &candidate.attr_path)
+            let result = if a.commit {
+                // Per-package branch flow: branch -> update -> build -> commit -> push -> cleanup.
+                commit_update_one(root, &main_branch, name, a)
+            } else {
+                // Temp worktree flow: no mutation of the checkout.
+                worktree_update_one(root, name)
+            };
+            match result {
+                Ok(outcome) => {
+                    log_outcome(name, outcome);
+                    if let Some(file) = package.file.filter(|_| outcome != NO_CHANGES) {
+                        updated_files.insert(file);
+                    }
+                    outcome
+                }
+                Err(err) => match err.strip_prefix(UNSUPPORTED) {
+                    Some(reason) => {
+                        info!("{name}: skipped ({reason})");
+                        "skipped"
+                    }
+                    None => {
+                        error!("{name}: failed: {err}");
+                        "failed"
+                    }
+                },
+            }
         };
-        match outcome {
-            Ok(BatchOutcome::NoChanges) => {
-                tracing::info!("{}: no changes", candidate.attr_path);
-                summary.no_changes += 1;
-            }
-            Ok(BatchOutcome::UpdatedBuildOk) => {
-                if let Some(file) = candidate.file.as_deref() {
-                    updated_files.insert(file.to_path_buf());
-                }
-                tracing::info!("{}: updated, build ok", candidate.attr_path);
-                summary.updated += 1;
-            }
-            Ok(BatchOutcome::UpdatedBuildFailed) => {
-                if let Some(file) = candidate.file.as_deref() {
-                    updated_files.insert(file.to_path_buf());
-                }
-                tracing::warn!("{}: updated, build failed", candidate.attr_path);
-                summary.build_failed += 1;
-            }
-            Err(err) => {
-                tracing::error!("{}: failed: {err}", candidate.attr_path);
-                summary.failed += 1;
-            }
-        }
+        *counts.entry(label).or_default() += 1;
     }
 
     // Return to the main branch.
-    if commit.commit {
+    if a.commit {
         let _ = git::checkout_branch(root, &main_branch);
     }
 
-    tracing::info!("--- summary ---");
-    tracing::info!("updated/build ok: {}", summary.updated);
-    tracing::info!("updated/build failed: {}", summary.build_failed);
-    tracing::info!("no changes: {}", summary.no_changes);
-    tracing::info!("failed: {}", summary.failed);
-    tracing::info!("skipped: {}", summary.skipped);
+    info!("--- summary ---");
+    for label in [BUILD_OK, BUILD_FAILED, NO_CHANGES, "failed", "skipped"] {
+        info!("{label}: {}", counts.get(label).copied().unwrap_or(0));
+    }
     Ok(())
 }
 
@@ -183,256 +159,145 @@ fn commit_update_one(
     root: &Path,
     main_branch: &str,
     package: &str,
-    commit: &CommitOptions,
-) -> Result<BatchOutcome, String> {
-    // Ensure a clean starting point on main.
+    a: &Args,
+) -> Result<&'static str, String> {
     git::checkout_branch(root, main_branch)?;
-    if !git::clean(root)? {
-        git::reset_hard(root, &format!("origin/{main_branch}"))?;
-    }
-
-    let branch_name = format!("{}{package}", commit.branch_prefix);
+    let branch = format!("{}{package}", a.branch_prefix);
     // Remove any leftover branch from a previous run.
-    let _ = git::delete_branch(root, &branch_name);
-    git::create_branch(root, &branch_name)?;
+    let _ = git::delete_branch(root, &branch);
+    git::create_branch(root, &branch)?;
 
-    let old_version = nix::package_version(root, package).unwrap_or_else(|_| "unknown".to_string());
-
+    let old_version = nix::package_version(root, package);
     run_update_script(root, package)?;
 
-    if git::clean(root)? {
-        git::checkout_branch(root, main_branch)?;
-        let _ = git::delete_branch(root, &branch_name);
-        return Ok(BatchOutcome::NoChanges);
-    }
-
     let changed_paths = git::changed_paths(root)?;
-    let new_version = nix::package_version(root, package).unwrap_or_else(|_| "unknown".to_string());
+    if changed_paths.is_empty() {
+        git::checkout_branch(root, main_branch)?;
+        let _ = git::delete_branch(root, &branch);
+        return Ok(NO_CHANGES);
+    }
+    let new_version = nix::package_version(root, package);
     let title = pr_title(package, &old_version, &new_version);
-
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        tracing::debug!("diffstat:");
+    if crate::verbose() {
         git::print_diff_stat(root)?;
     }
 
-    let build_skipped = commit.no_build.iter().any(|s| s == package);
-
-    let (build_ok, build_log) = if build_skipped {
-        tracing::info!("{}: build skipped (no-build)", package);
-        (
-            true,
-            "Build intentionally skipped (in no-build list).\n".to_string(),
-        )
+    let (build_ok, build_log) = if skip_build(a, package) {
+        info!("{package}: build skipped (no-build)");
+        (None, String::new())
     } else {
-        nix::build_package_with_log(root, package)?
+        let (ok, log) = nix::build_package_with_log(root, package)?;
+        (Some(ok), log)
     };
+    let body = pr_body(root, package, &old_version, &new_version, build_ok, &build_log);
+    commit(root, &changed_paths, &title, &body, a)?;
 
-    if let Some(format) = commit.gpg_format.as_deref() {
-        git::run(root, &["config", "gpg.format", format])?;
-    }
-    if let Some(key) = commit.signing_key.as_deref() {
-        git::run(root, &["config", "user.signingkey", key])?;
-    }
-    let (nixpkgs_input, nixpkgs_rev) = nixpkgs_input_info(root);
-    let body = pr_body(
-        package,
-        &old_version,
-        &new_version,
-        build_ok,
-        build_skipped,
-        Some(&build_log),
-        nixpkgs_input.as_deref(),
-        nixpkgs_rev.as_deref(),
-    );
-    git::commit_paths(root, &changed_paths, &title, &body, commit.signed)?;
-
-    let mut commit_pushed_ok = false;
-    if commit.push {
-        match git::push_branch(root, &branch_name) {
-            Ok(()) => {
-                commit_pushed_ok = true;
-                tracing::debug!("pushed branch {branch_name}");
-                if commit.pr {
-                    let token = std::env::var("GITHUB_TOKEN").ok();
-                    let remote_url = git::remote_url(root)?;
-                    let forge_backend = forge::resolve(
-                        &commit.forge,
-                        commit.forge_api_url.as_deref(),
-                        token.as_deref(),
-                        &remote_url,
-                    );
-                    match forge_backend {
-                        Ok(backend) => {
-                            let (owner, repo) = owner_repo_from_url(&remote_url)?;
-                            match backend.find_existing_pr(
-                                root,
-                                &branch_name,
-                                main_branch,
-                                &owner,
-                                &repo,
-                            ) {
-                                Ok(Some(pr_num)) => {
-                                    tracing::info!("{}: PR #{pr_num} already exists", package);
-                                }
-                                Ok(None) => {
-                                    tracing::info!("{}: opening PR...", package);
-                                    match backend.create_pr(
-                                        root,
-                                        &branch_name,
-                                        main_branch,
-                                        &title,
-                                        &body,
-                                        &owner,
-                                        &repo,
-                                    ) {
-                                        Ok(url) => tracing::info!("{}: PR created: {url}", package),
-                                        Err(err) => tracing::warn!("PR creation failed: {err}"),
-                                    }
-                                }
-                                Err(err) => tracing::warn!("find existing PR failed: {err}"),
-                            }
-                        }
-                        Err(err) => tracing::warn!("forge backend not available: {err}"),
-                    }
-                }
+    // Skip the force-push when the remote branch already has this exact
+    // content, so an open PR is not churned on every run.
+    let pushed = a.push
+        && (git::matches_remote(root, &branch)
+            || git::push_branch(root, &branch)
+                .map_err(|err| warn!("{package}: push failed: {err}"))
+                .is_ok());
+    if pushed && a.pr {
+        let pr = git::remote_url(root).and_then(|remote| {
+            let token = env::var("GITHUB_TOKEN").ok();
+            forge::resolve(&a.forge, a.forge_api_url.as_deref(), token.as_deref(), &remote)?
+                .create_pr(root, &branch, main_branch, &title, &body)
+        });
+        match pr {
+            Ok(url) => info!("{package}: PR created: {url}"),
+            Err(err) if err.contains("already exists") => {
+                info!("{package}: PR already exists, branch updated")
             }
-            Err(err) => {
-                tracing::warn!("push failed: {err}");
-            }
+            Err(err) => warn!("{package}: PR creation failed: {err}"),
         }
     }
-
-    let outcome = if build_ok {
-        BatchOutcome::UpdatedBuildOk
-    } else {
-        BatchOutcome::UpdatedBuildFailed
-    };
 
     // Return to main. Only drop the per-package branch once its commit is
     // durably stored on the remote; on push failure (or when --push was not
     // requested) keep the branch so the commit survives for inspection/retry.
     git::checkout_branch(root, main_branch)?;
-    if commit_pushed_ok {
-        let _ = git::delete_branch(root, &branch_name);
+    if pushed {
+        let _ = git::delete_branch(root, &branch);
     } else {
-        tracing::warn!("{}: keeping branch {branch_name} (commit not on remote)", package);
+        warn!("{package}: keeping branch {branch} (commit not on remote)");
     }
-    Ok(outcome)
+    Ok(if build_ok == Some(false) { BUILD_FAILED } else { BUILD_OK })
 }
 
-fn batch_update_one(root: &Path, package: &str) -> Result<BatchOutcome, String> {
+/// Update and build in a temp worktree, leaving the checkout untouched.
+fn worktree_update_one(root: &Path, package: &str) -> Result<&'static str, String> {
     let worktree = TempWorktree::create(root)?;
     run_update_script(worktree.path(), package)?;
     if git::clean(worktree.path())? {
-        return Ok(BatchOutcome::NoChanges);
+        return Ok(NO_CHANGES);
     }
-    if nix::build_package(worktree.path(), package)? {
-        Ok(BatchOutcome::UpdatedBuildOk)
-    } else {
-        Ok(BatchOutcome::UpdatedBuildFailed)
+    // git writes the diff straight to stdout, so gate it on the log level.
+    if crate::verbose() {
+        git::print_diff_stat(worktree.path())?;
+        git::print_diff(worktree.path())?;
     }
+    let built = nix::build_package(worktree.path(), package)?;
+    Ok(if built { BUILD_OK } else { BUILD_FAILED })
 }
 
-#[derive(Default)]
-struct BatchSummary {
-    updated: usize,
-    build_failed: usize,
-    no_changes: usize,
-    failed: usize,
-    skipped: usize,
-}
+pub fn update_package(root: &Path, package: &str, a: &Args) -> Result<(), String> {
+    ensure_clean(root)?;
 
-enum BatchOutcome {
-    NoChanges,
-    UpdatedBuildOk,
-    UpdatedBuildFailed,
-}
-
-pub fn update_package(root: &Path, package: &str, commit: CommitOptions) -> Result<(), String> {
-    if !git::clean(root)? {
-        return Err(
-            "working tree has uncommitted or untracked changes; commit/stash them before update"
-                .to_string(),
-        );
-    }
-
-    if commit.push || commit.pr {
+    if a.push {
         // Per-package branch flow, same as batch mode: branch -> update ->
         // build -> commit -> push -> PR -> return to the current branch.
         let main_branch = git::current_branch(root)?;
         ensure_on_branch(&main_branch)?;
-        match commit_update_one(root, &main_branch, package, &commit)? {
-            BatchOutcome::NoChanges => tracing::info!("{package}: no changes"),
-            BatchOutcome::UpdatedBuildOk => tracing::info!("{package}: updated, build ok"),
-            BatchOutcome::UpdatedBuildFailed => {
-                tracing::warn!("{package}: updated, build failed")
-            }
-        }
+        let result = commit_update_one(root, &main_branch, package, a);
+        let _ = git::checkout_branch(root, &main_branch);
+        log_outcome(package, result?);
         return Ok(());
     }
 
-    let old_version = nix::package_version(root, package).unwrap_or_else(|_| "unknown".to_string());
+    let old_version = nix::package_version(root, package);
     run_update_script(root, package)?;
 
     let changed_paths = git::changed_paths(root)?;
     if changed_paths.is_empty() {
-        tracing::info!("No diff after running update script.");
+        info!("No diff after running update script.");
         return Ok(());
     }
 
-    let new_version = nix::package_version(root, package).unwrap_or_else(|_| "unknown".to_string());
+    let new_version = nix::package_version(root, package);
     let title = pr_title(package, &old_version, &new_version);
-
-    tracing::info!("--- suggested PR title ---\n{title}");
-    tracing::info!("--- diffstat ---");
+    info!("--- suggested PR title ---\n{title}");
     git::print_diff_stat(root)?;
 
-    let build_skipped = commit.no_build.iter().any(|s| s == package);
-    if build_skipped {
-        tracing::info!("--- build skipped (no-build) ---");
+    let build_ok = if skip_build(a, package) {
+        info!("--- build skipped (no-build) ---");
+        None
+    } else if nix::build_package(root, package)? {
+        Some(true)
     } else {
-        tracing::info!("--- build ---");
-        if !nix::build_package(root, package)? {
-            return Err("build failed; leaving changes in working tree".to_string());
-        }
-    }
-    let (nixpkgs_input, nixpkgs_rev) = nixpkgs_input_info(root);
-    let body = pr_body(
-        package,
-        &old_version,
-        &new_version,
-        true,
-        build_skipped,
-        None,
-        nixpkgs_input.as_deref(),
-        nixpkgs_rev.as_deref(),
-    );
-    tracing::info!("--- suggested PR body ---\n{body}");
+        return Err("build failed; leaving changes in working tree".to_string());
+    };
+    let body = pr_body(root, package, &old_version, &new_version, build_ok, "");
+    info!("--- suggested PR body ---\n{body}");
 
-    if commit.commit {
-        if let Some(format) = commit.gpg_format.as_deref() {
-            git::run(root, &["config", "gpg.format", format])?;
-        }
-        if let Some(key) = commit.signing_key.as_deref() {
-            git::run(root, &["config", "user.signingkey", key])?;
-        }
-        git::commit_paths(root, &changed_paths, &title, &body, commit.signed)?;
-        tracing::info!(
-            "Committed{}: {title}",
-            if commit.signed { " signed" } else { "" }
-        );
+    if a.commit {
+        commit(root, &changed_paths, &title, &body, a)?;
+        info!("Committed{}: {title}", if a.signed { " signed" } else { "" });
     } else {
-        tracing::info!(
+        info!(
             "No commit created. Re-run with --commit to commit, or --commit --signed for a signed commit."
         );
     }
-
     Ok(())
 }
 
-/// Run a package's updateScript directly (no CLI arg parsing needed - clap handles it).
-pub fn run_update_script_direct(root: &Path, package: &str) -> Result<(), String> {
-    run_update_script(root, package)
+fn dir_is_writable(dir: &Path) -> bool {
+    // Mode-bit checks lie for group-writable dirs like /nix/store (1775).
+    // Probe with an actual create, which respects the effective uid.
+    let probe = dir.join(".bumpkin-write-probe");
+    let created = fs::OpenOptions::new().write(true).create_new(true).open(&probe);
+    created.is_ok() && fs::remove_file(&probe).is_ok()
 }
 
 /// Pure-flake evaluation flattens bare-path updateScripts (e.g. `./update.sh`)
@@ -441,32 +306,12 @@ pub fn run_update_script_direct(root: &Path, package: &str) -> Result<(), String
 /// contains a file with identical content, return that copy - writable
 /// directory, same script. This mirrors how nixpkgs' update.py runs scripts
 /// from the checkout rather than the store.
-fn dir_is_writable(dir: &Path) -> bool {
-    // Mode-bit checks lie for group-writable dirs like /nix/store (1775).
-    // Probe with an actual create, which respects the effective uid.
-    let probe = dir.join(".bumpkin-write-probe");
-    let created = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe);
-    if created.is_ok() {
-        let _ = fs::remove_file(&probe);
-        true
-    } else {
-        false
-    }
-}
-
-fn writable_script_copy(root: &Path, package: &str, store_script: &Path) -> Option<PathBuf> {
-    if !store_script.is_file() {
-        return None;
-    }
-    if dir_is_writable(store_script.parent()?) {
+fn writable_script_copy(package_file: Option<&Path>, store_script: &Path) -> Option<PathBuf> {
+    if !store_script.is_file() || dir_is_writable(store_script.parent()?) {
         return None;
     }
     let store_bytes = fs::read(store_script).ok()?;
-    let dir = packages::file_for_attr(root, package)?.parent()?.to_path_buf();
-    let entries = fs::read_dir(&dir).ok()?;
+    let entries = fs::read_dir(package_file?.parent()?).ok()?;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() || path.extension().is_some_and(|ext| ext == "nix") {
@@ -479,20 +324,25 @@ fn writable_script_copy(root: &Path, package: &str, store_script: &Path) -> Opti
     None
 }
 
-fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
-    // Detect and fix GitHub repository transfers before running updates.
-    if let Err(e) = fix_repo_redirect(root, package) {
-        tracing::debug!("{package}: redirect check skipped: {e}");
-    }
-
-    tracing::debug!("{package}: trying updateScript...");
+/// Run the package's updateScript, or the native updater when it has none.
+pub fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
+    let info = nix::package_info(root, package)?;
+    debug!("{package}: trying updateScript...");
     match nix::build_update_script(root, package) {
         Ok(script_out) => {
             let script = find_executable_in_output(Path::new(&script_out))?;
-            let script = writable_script_copy(root, package, &script).unwrap_or(script);
+            let script = writable_script_copy(info.file.as_deref(), &script).unwrap_or(script);
+            // Same environment as nixpkgs' `maintainers/scripts/update.py`
+            // (nix-update reads the attr path from it).
+            let env = [
+                ("UPDATE_NIX_ATTR_PATH", package),
+                ("UPDATE_NIX_NAME", &info.name),
+                ("UPDATE_NIX_PNAME", &info.pname),
+                ("UPDATE_NIX_OLD_VERSION", &info.version),
+            ];
             let status = Command::new(&script)
                 .current_dir(root)
-                .envs(nix::update_script_env(root, package))
+                .envs(env.into_iter().filter(|(_, value)| !value.is_empty()))
                 .status()
                 .map_err(|e| format!("run {}: {e}", script.display()))?;
             // No native fallback here: a broken updateScript should surface,
@@ -507,8 +357,8 @@ fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
             }
         }
         Err(err) => {
-            tracing::debug!("{package}: no runnable updateScript:\n{err}");
-            native_fetcher_update(root, package)
+            debug!("{package}: no runnable updateScript:\n{err}");
+            native_fetcher_update(root, package, &info)
         }
     }
 }
@@ -522,14 +372,15 @@ fn run_update_script(root: &Path, package: &str) -> Result<(), String> {
 /// 3. Rewrite the version, set the src + dependency hashes to the fake hash,
 ///    and let `nix build` report the real ones - Nix runs the fetcher itself,
 ///    so this supports every fetcher without bot-side prefetch logic.
-fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
-    tracing::debug!("{package}: trying native fetcher...");
-    let file = packages::file_for_attr(root, package)
-        .ok_or_else(|| format!("could not find package file for {package}"))?;
-    let mut text =
-        fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
-    let old_version =
-        extract_assignment(&text, "version").ok_or("could not find version assignment")?;
+fn native_fetcher_update(root: &Path, package: &str, info: &nix::PackageInfo) -> Result<(), String> {
+    debug!("{package}: trying native fetcher...");
+    let Some(file) = info.file.as_deref() else {
+        return Err(unsupported("no package file (meta.position) inside the flake"));
+    };
+    let mut text = fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))?;
+    let Some(old_version) = extract_assignment(&text, "version") else {
+        return Err(unsupported("could not find a version assignment"));
+    };
 
     // The src must be derived from the version (rev/tag/url referencing
     // ${version}); otherwise bumping the version would not change the source.
@@ -538,30 +389,22 @@ fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
     let Some(prefix) = version_linked_prefix(src_scope(&text), &old_version)
         .or_else(|| version_linked_prefix(&text, &old_version))
     else {
-        return Err(repology_hint(
-            &text,
-            &old_version,
+        return Err(unsupported(
             "src is not version-linked (no rev/tag/url containing ${version})",
         ));
     };
-
-    let src = nix::src_info(root, package)?;
-    let Some(git_url) = git_url_from_src(&src.git_repo_url, &src.urls) else {
-        return Err(repology_hint(
-            &text,
-            &old_version,
-            "could not derive a git URL from the evaluated src",
-        ));
+    let Some(git_url) = git_url_from_src(&info.git_repo_url, &info.urls) else {
+        return Err(unsupported("could not derive a git URL from the evaluated src"));
     };
 
-    tracing::debug!("{package}: listing tags on {git_url}");
+    debug!("{package}: listing tags on {git_url}");
     let tags = ls_remote_tags(&git_url)?;
     let latest = best_version(&tags, &prefix, &old_version);
     if latest == old_version {
-        tracing::debug!("{package}: already at latest version {latest}");
+        debug!("{package}: already at latest version {latest}");
         return Ok(());
     }
-    tracing::debug!("{package}: {old_version} -> {latest}");
+    debug!("{package}: {old_version} -> {latest}");
 
     let old_version_assignment = format!("version = \"{old_version}\";");
     if !text.contains(&old_version_assignment) {
@@ -583,13 +426,6 @@ fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
         let Some(value) = extract_assignment(src_scope(&text), key) else {
             continue;
         };
-        if value.contains("${version}")
-            || value.contains("${finalAttrs.version}")
-            || value == "version"
-            || value == "finalAttrs.version"
-        {
-            continue;
-        }
         if value == format!("{prefix}{old_version}") {
             let old_assignment = format!("{key} = \"{value}\";");
             let new_assignment = format!("{key} = \"{prefix}{latest}\";");
@@ -598,11 +434,10 @@ fn native_fetcher_update(root: &Path, package: &str) -> Result<(), String> {
             text.replace_range(start..end, &scope);
         }
     }
-    let dep_hashes = dependency_hash_keys(&text);
-    text = replace_dep_hashes_with_fake(&text, &dep_hashes);
-    fs::write(&file, text).map_err(|e| format!("write {}: {e}", file.display()))?;
+    text = replace_dep_hashes_with_fake(&text);
+    fs::write(file, text).map_err(|e| format!("write {}: {e}", file.display()))?;
 
-    refresh_fake_hashes(root, package, &file)
+    refresh_fake_hashes(root, package, file)
 }
 
 /// The well-known fake hash accepted by all Nix fetchers.
@@ -613,41 +448,27 @@ const FAKE_HASH: &str = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 /// build (later fetches depend on earlier ones), so loop until none remain.
 fn refresh_fake_hashes(root: &Path, package: &str, file: &Path) -> Result<(), String> {
     loop {
-        let text = fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))?;
+        let mut text =
+            fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))?;
         let remaining = text.matches(FAKE_HASH).count();
         if remaining == 0 {
             return Ok(());
         }
-        tracing::debug!("{package}: building to compute {remaining} remaining hash(es)...");
-        let wanted = build_and_extract_wanted_hashes(root, package)?;
+        debug!("{package}: building to compute {remaining} remaining hash(es)...");
+        let (built, log) = nix::build_package_with_log(root, package)?;
+        let wanted = extract_wanted_hashes(&log);
         if wanted.is_empty() {
-            return Err(
-                "build did not report a hash mismatch for the remaining fake hash(es)".to_string(),
-            );
+            return Err(if built {
+                "build did not report a hash mismatch for the remaining fake hash(es)".to_string()
+            } else {
+                format!("could not extract wanted hash from build output\n{log}")
+            });
         }
-        let mut text = text;
         for hash in &wanted {
             text = text.replacen(FAKE_HASH, hash, 1);
         }
         fs::write(file, &text).map_err(|e| format!("write {}: {e}", file.display()))?;
-        if text.matches(FAKE_HASH).count() >= remaining {
-            return Err("build output did not resolve any fake hash".to_string());
-        }
     }
-}
-
-/// Consult repology for a version hint before giving up, so the error tells
-/// the user whether an update is actually pending.
-fn repology_hint(text: &str, old_version: &str, reason: &str) -> String {
-    if let Some(pname) = extract_assignment(text, "pname")
-        && let Some(repology_ver) = repology::latest_version(&pname)
-        && repology_ver != old_version
-    {
-        return format!(
-            "{reason}; Repology knows {pname} = {repology_ver} (nix has {old_version}) - add an updateScript"
-        );
-    }
-    format!("{reason}; add an updateScript")
 }
 
 /// Find the tag prefix from the first rev/tag/url assignment that references
@@ -671,9 +492,7 @@ fn version_linked_prefix(text: &str, old_version: &str) -> Option<String> {
         }
         // Literal rev/tag: the value ends with the current version (e.g.
         // "v1.2.3" with version "1.2.3" -> prefix "v").
-        if let Some(prefix) = template.strip_suffix(old_version)
-            && (!prefix.is_empty() || template == *old_version)
-        {
+        if let Some(prefix) = template.strip_suffix(old_version) {
             return Some(prefix.to_string());
         }
     }
@@ -860,82 +679,6 @@ fn src_scope(text: &str) -> &str {
     src_block_range(text).map_or(text, |(start, end)| &text[start..end])
 }
 
-/// Extract (owner, repo) from a git remote URL.
-fn owner_repo_from_url(url: &str) -> Result<(String, String), String> {
-    let (_, owner, repo) = forge::parse_repo_url(url)?;
-    Ok((owner, repo))
-}
-
-/// Check if a GitHub repository has been transferred/renamed.
-/// Returns `Some((new_owner, new_repo))` if the repo redirects.
-fn check_github_redirect(url: &str) -> Option<(String, String)> {
-    if !url.contains("github.com") {
-        return None;
-    }
-    let web_url = url
-        .strip_prefix("git+")
-        .unwrap_or(url)
-        .strip_suffix(".git")
-        .unwrap_or(url);
-    let output = Command::new("curl")
-        .args([
-            "-s", "-o", "/dev/null", "-w", "%{redirect_url}",
-            "--max-time", "5",
-            web_url,
-        ])
-        .output()
-        .ok()?;
-    let redirect = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if redirect.is_empty() || redirect == web_url {
-        return None;
-    }
-    let (_, new_owner, new_repo) = forge::parse_repo_url(&redirect).ok()?;
-    let (_, old_owner, old_repo) = forge::parse_repo_url(web_url).ok()?;
-    if new_owner != old_owner || new_repo != old_repo {
-        Some((new_owner, new_repo))
-    } else {
-        None
-    }
-}
-
-/// Check whether the Git remote for a package has been transferred/renamed
-/// (currently GitHub only).  When a redirect is detected the `owner` and
-/// `repo` fields in the source file are rewritten in-place.
-fn fix_repo_redirect(root: &Path, package: &str) -> Result<(), String> {
-    let src = nix::src_info(root, package)?;
-    let Some(git_url) = git_url_from_src(&src.git_repo_url, &src.urls) else {
-        return Ok(());
-    };
-    let Some((new_owner, new_repo)) = check_github_redirect(&git_url) else {
-        return Ok(());
-    };
-    let Some(file) = packages::file_for_attr(root, package) else {
-        return Ok(());
-    };
-    let mut text =
-        fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
-    let mut changed = false;
-    for (field, new_val) in [("owner", new_owner.as_str()), ("repo", new_repo.as_str())] {
-        if let Some(old_val) = extract_assignment(&text, field) {
-            if old_val != new_val {
-                let old = format!("{field} = \"{old_val}\";");
-                let new = format!("{field} = \"{new_val}\";");
-                text = text.replacen(&old, &new, 1);
-                tracing::warn!("{package}: {field} changed ({old_val} -> {new_val})");
-                changed = true;
-            }
-        }
-    }
-    if changed {
-        fs::write(&file, text)
-            .map_err(|e| format!("write {}: {e}", file.display()))?;
-        tracing::info!(
-            "{package}: updated owner/repo ({new_owner}/{new_repo})"
-        );
-    }
-    Ok(())
-}
-
 fn replace_src_hash(text: &str, new_hash: &str) -> Result<String, String> {
     let src_pos = assignment_value_start(text, "src").ok_or("missing src assignment")?;
     // Prefer the src fetcher's own attrset; fall back to "anything after src".
@@ -949,33 +692,24 @@ fn replace_src_hash(text: &str, new_hash: &str) -> Result<String, String> {
         .ok_or("missing src hash")?;
     let start = scope_start + value_start + 1;
     let end = start + text[start..].find('"').ok_or("unterminated src hash")?;
-    let mut out = String::with_capacity(text.len() + new_hash.len());
-    out.push_str(&text[..start]);
-    out.push_str(new_hash);
-    out.push_str(&text[end..]);
-    Ok(out)
+    Ok(format!("{}{new_hash}{}", &text[..start], &text[end..]))
 }
 
-fn dependency_hash_keys(text: &str) -> Vec<&'static str> {
-    [
-        "cargoHash",
-        "vendorHash",
-        "npmDepsHash",
-        "yarnHash",
-        "pomHash",
-        "mvnHash",
-        "mixHash",
-        "nugetHash",
-        "dotnetHash",
-    ]
-    .into_iter()
-    .filter(|key| text.contains(&format!("{key} = \"")))
-    .collect()
-}
+const DEPENDENCY_HASH_KEYS: [&str; 9] = [
+    "cargoHash",
+    "vendorHash",
+    "npmDepsHash",
+    "yarnHash",
+    "pomHash",
+    "mvnHash",
+    "mixHash",
+    "nugetHash",
+    "dotnetHash",
+];
 
-fn replace_dep_hashes_with_fake(text: &str, keys: &[&str]) -> String {
+fn replace_dep_hashes_with_fake(text: &str) -> String {
     let mut out = text.to_string();
-    for key in keys {
+    for key in DEPENDENCY_HASH_KEYS {
         let needle = format!("{key} = \"");
         if let Some(pos) = out.find(&needle) {
             let start = pos + needle.len();
@@ -987,38 +721,13 @@ fn replace_dep_hashes_with_fake(text: &str, keys: &[&str]) -> String {
     out
 }
 
-fn build_and_extract_wanted_hashes(root: &Path, package: &str) -> Result<Vec<String>, String> {
-    let out = crate::nix::nix_cmd()
-        .args([
-            "build",
-            "--no-link",
-            &format!("path:{}#{package}", root.display()),
-        ])
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("build for dependency hash: {e}"))?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let hashes = extract_wanted_hashes(&stderr);
-    if hashes.is_empty() && !out.status.success() {
-        return Err(format!(
-            "could not extract wanted dependency hash from build output\n{stderr}"
-        ));
-    }
-    Ok(hashes)
-}
-
 fn extract_wanted_hashes(text: &str) -> Vec<String> {
-    let mut hashes = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("got:") {
-            let hash = rest.trim();
-            if hash.starts_with("sha256-") {
-                hashes.push(hash.to_string());
-            }
-        }
-    }
-    hashes
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("got:"))
+        .map(str::trim)
+        .filter(|hash| hash.starts_with("sha256-"))
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_version(version: &str) -> Option<Vec<u64>> {
@@ -1039,67 +748,45 @@ fn version_gt(a: &str, b: &str) -> bool {
     }
 }
 
-/// nixpkgs input name and rev for PR bodies; `None` where unknown.
-fn nixpkgs_input_info(root: &Path) -> (Option<String>, Option<String>) {
-    let (input, rev) = nix::flake_input_info(root).unwrap_or_default();
-    let non_empty = |s: String| (!s.is_empty()).then_some(s);
-    (non_empty(input), non_empty(rev))
-}
-
 fn pr_title(package: &str, old_version: &str, new_version: &str) -> String {
     format!("feat({package}): {old_version} -> {new_version}")
 }
 
-#[allow(clippy::too_many_arguments, clippy::collapsible_if)]
+/// `build_ok` is `None` when the build was skipped (no-build list).
 fn pr_body(
+    root: &Path,
     package: &str,
     old_version: &str,
     new_version: &str,
-    build_ok: bool,
-    build_skipped: bool,
-    build_log: Option<&str>,
-    nixpkgs_input: Option<&str>,
-    nixpkgs_rev: Option<&str>,
+    build_ok: Option<bool>,
+    build_log: &str,
 ) -> String {
-    let current = current_platform();
-    let build_note = if build_skipped {
-        format!("**Built on platform:**\n\n- [ ] `{current}` skipped ⏩ (in no-build list)\n\n")
-    } else if build_ok {
-        format!("**Built on platform:**\n\n- [x] `{current}`\n\n")
-    } else {
-        format!("**Built on platform:**\n\n- [ ] `{current}` failed ⚠️\n\n")
+    let os = if env::consts::OS == "macos" { "darwin" } else { env::consts::OS };
+    let (check, note) = match build_ok {
+        Some(true) => ("x", ""),
+        Some(false) => (" ", " failed ⚠️"),
+        None => (" ", " skipped ⏩ (in no-build list)"),
     };
-    let mut body =
-        format!("Update `{package}` from `{old_version}` to `{new_version}`.\n\n{build_note}");
-    if let Some(input) = nixpkgs_input {
-        if let Some(rev) = nixpkgs_rev {
-            body.push_str(&format!("**Flake:** `{input}` at `{rev}`\n\n"));
-        } else {
-            body.push_str(&format!("**Flake:** `{input}`\n\n"));
-        }
+    let mut body = format!(
+        "Update `{package}` from `{old_version}` to `{new_version}`.\n\n\
+         **Built on platform:**\n\n- [{check}] `{}-{os}`{note}\n\n",
+        env::consts::ARCH
+    );
+    let (input, rev) = nix::flake_input_info(root);
+    if !input.is_empty() && !rev.is_empty() {
+        body.push_str(&format!("**Flake:** `{input}` at `{rev}`\n\n"));
+    } else if !input.is_empty() {
+        body.push_str(&format!("**Flake:** `{input}`\n\n"));
     }
     body.push_str("Generated by [bumpkin](https://github.com/74k1/bumpkin).");
-    if !build_ok
-        && !build_skipped
-        && let Some(log) = build_log
-    {
-        let tail: Vec<&str> = log.lines().rev().take(20).collect();
-        let tail: Vec<&str> = tail.into_iter().rev().collect();
-        body.push_str("\n\n<details>\n<summary>Build log (last 20 lines)</summary>\n\n```\n");
-        body.push_str(&tail.join("\n"));
-        body.push_str("\n```\n</details>\n");
+    if build_ok == Some(false) {
+        let lines: Vec<&str> = build_log.lines().collect();
+        let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+        body.push_str(&format!(
+            "\n\n<details>\n<summary>Build log (last 20 lines)</summary>\n\n```\n{tail}\n```\n</details>\n"
+        ));
     }
     body
-}
-
-fn current_platform() -> &'static str {
-    match (std::env::consts::ARCH, std::env::consts::OS) {
-        ("x86_64", "linux") => "x86_64-linux",
-        ("aarch64", "linux") => "aarch64-linux",
-        ("x86_64", "macos") => "x86_64-darwin",
-        ("aarch64", "macos") => "aarch64-darwin",
-        _ => "unknown",
-    }
 }
 
 struct TempWorktree {
@@ -1114,17 +801,8 @@ impl TempWorktree {
             .map_err(|e| format!("system time: {e}"))?
             .as_nanos();
         let temp = env::temp_dir().join(format!("bumpkin-{}-{stamp}", std::process::id()));
-        git::run(
-            root,
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                "--detach",
-                temp.to_str().ok_or("non-utf8 temp path")?,
-                "HEAD",
-            ],
-        )?;
+        let path = temp.to_str().ok_or("non-utf8 temp path")?;
+        git::run(root, &["worktree", "add", "--quiet", "--detach", path, "HEAD"])?;
         copy_tracked_working_changes(root, &temp)?;
         Ok(Self {
             root: temp,
@@ -1152,50 +830,29 @@ fn copy_tracked_working_changes(from: &Path, to: &Path) -> Result<(), String> {
     let mut apply = Command::new("git")
         .args(["apply", "--index"])
         .current_dir(to)
-        .stdin(std::process::Stdio::piped())
+        .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| format!("start git apply: {e}"))?;
-    {
-        use std::io::Write;
-        apply
-            .stdin
-            .as_mut()
-            .ok_or("git apply stdin unavailable")?
-            .write_all(&diff.stdout)
-            .map_err(|e| format!("write git apply diff: {e}"))?;
-    }
+    apply
+        .stdin
+        .take()
+        .ok_or("git apply stdin unavailable")?
+        .write_all(&diff.stdout)
+        .map_err(|e| format!("write git apply diff: {e}"))?;
     let status = apply
         .wait()
         .map_err(|e| format!("wait for git apply: {e}"))?;
     if !status.success() {
         return Err(format!("git apply exited with {status}"));
     }
-    git::run(
-        to,
-        &[
-            "-c",
-            "user.name=bumpkin",
-            "-c",
-            "user.email=bumpkin@example.invalid",
-            "commit",
-            "--quiet",
-            "-m",
-            "bumpkin dry-run baseline",
-        ],
-    )
+    let identity = ["-c", "user.name=bumpkin", "-c", "user.email=bumpkin@example.invalid"];
+    git::run(to, &[&identity[..], &["commit", "--quiet", "-m", "bumpkin dry-run baseline"]].concat())
 }
 
 impl Drop for TempWorktree {
     fn drop(&mut self) {
-        let _ = git::run(
-            &self.original,
-            &[
-                "worktree",
-                "remove",
-                "--force",
-                self.root.to_str().unwrap_or(""),
-            ],
-        );
+        let path = self.root.to_str().unwrap_or("");
+        let _ = git::run(&self.original, &["worktree", "remove", "--force", path]);
     }
 }
 

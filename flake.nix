@@ -24,7 +24,10 @@
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "bumpkin";
             version = cargoToml.package.version;
-            src = ./.;
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [ ./src ./Cargo.toml ./Cargo.lock ];
+            };
             cargoLock.lockFile = ./Cargo.lock;
           };
         });

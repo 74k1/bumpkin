@@ -748,6 +748,24 @@ fn version_gt(a: &str, b: &str) -> bool {
     }
 }
 
+/// Best-effort upstream compare link between the old and new version tags.
+fn compare_url(root: &Path, package: &str, old: &str, new: &str) -> Option<String> {
+    let info = nix::package_info(root, package).ok()?;
+    let text = fs::read_to_string(info.file?).ok()?;
+    let prefix = version_linked_prefix(src_scope(&text), new)?;
+    compare_link(&git_url_from_src(&info.git_repo_url, &info.urls)?, &prefix, old, new)
+}
+
+fn compare_link(git_url: &str, prefix: &str, old: &str, new: &str) -> Option<String> {
+    let repo = git_url.trim_end_matches(".git");
+    let path = match repo {
+        _ if old == new || repo.contains("git.sr.ht") => return None,
+        _ if repo.contains("gitlab") => "/-/compare/",
+        _ => "/compare/",
+    };
+    Some(format!("{repo}{path}{prefix}{old}...{prefix}{new}"))
+}
+
 fn pr_title(package: &str, old_version: &str, new_version: &str) -> String {
     format!("feat({package}): {old_version} -> {new_version}")
 }
@@ -772,6 +790,15 @@ fn pr_body(
          **Built on platform:**\n\n- [{check}] `{}-{os}`{note}\n\n",
         env::consts::ARCH
     );
+    if build_ok == Some(true) {
+        body.push_str(&match nix::version_check(root, package) {
+            Some(command) => format!("- [x] `{command}` prints `{new_version}`\n\n"),
+            None => "- [ ] no binary printed the version (`--version`, `-V`, `--help`)\n\n".into(),
+        });
+    }
+    if let Some(url) = compare_url(root, package, old_version, new_version) {
+        body.push_str(&format!("**Changes:** {url}\n\n"));
+    }
     let (input, rev) = nix::flake_input_info(root);
     if !input.is_empty() && !rev.is_empty() {
         body.push_str(&format!("**Flake:** `{input}` at `{rev}`\n\n"));
@@ -1041,6 +1068,20 @@ mod tests {
             "\nerror: hash mismatch\n  specified: sha256-xxx\n       got:    sha256-abc123=\n",
         );
         assert_eq!(hashes, vec!["sha256-abc123=".to_string()]);
+    }
+
+    #[test]
+    fn compare_links_per_forge() {
+        assert_eq!(
+            compare_link("https://github.com/o/r.git", "v", "1.0", "1.1").as_deref(),
+            Some("https://github.com/o/r/compare/v1.0...v1.1")
+        );
+        assert_eq!(
+            compare_link("https://gitlab.com/o/r.git", "", "1.0", "1.1").as_deref(),
+            Some("https://gitlab.com/o/r/-/compare/1.0...1.1")
+        );
+        assert_eq!(compare_link("https://git.sr.ht/~o/r", "v", "1.0", "1.1"), None);
+        assert_eq!(compare_link("https://github.com/o/r.git", "v", "1.0", "1.0"), None);
     }
 
     #[test]

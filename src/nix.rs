@@ -121,6 +121,54 @@ pub fn package_info(root: &Path, package: &str) -> Result<PackageInfo, String> {
     Ok(info)
 }
 
+/// Run the built package's binaries with `--version` / `-V` / `--help` and
+/// return the first invocation (e.g. `foo --version`) that prints the package
+/// version. This runs as a derivation, so inside the Nix sandbox: no network,
+/// none of bumpkin's secrets.
+pub fn version_check(root: &Path, package: &str) -> Option<String> {
+    // Never run upstream binaries unless Nix actually sandboxes builds
+    // (off by default on macOS, or with `sandbox = false`).
+    let sandbox = nix_cmd().args(["config", "show", "sandbox"]).output().ok()?;
+    if !matches!(String::from_utf8_lossy(&sandbox.stdout).trim(), "true" | "relaxed") {
+        return None;
+    }
+    let expr = version_check_expr(&flake_ref(root).ok()?, package);
+    let out = nix_cmd()
+        .args(["build", "--no-link", "--print-out-paths", "--impure", "--timeout", "60"])
+        .args(["--expr", &expr])
+        .output()
+        .ok()?;
+    let hit = std::fs::read_to_string(String::from_utf8_lossy(&out.stdout).trim()).ok()?;
+    Some(hit.trim().rsplit('/').next()?.to_string())
+}
+
+fn version_check_expr(flake_ref: &str, package: &str) -> String {
+    format!(
+        r#"
+let
+  flake = builtins.getFlake "{flake_ref}";
+  {PRELUDE}
+  package = flakePackages."{package}" or legacyPackages."{package}";
+in derivation {{
+  name = "bumpkin-version-check";
+  inherit system;
+  builder = "/bin/sh";
+  args = [ "-c" ''
+    for bin in ${{package}}/bin/*; do
+      for flag in --version -V --help; do
+        case "$("$bin" $flag 2>&1 </dev/null)" in
+          *"${{package.version}}"*) echo "$bin $flag" > $out; exit 0 ;;
+        esac
+      done
+    done
+    exit 1
+  '' ];
+}}
+"#,
+        package = escape_nix_string(package)
+    )
+}
+
 pub fn build_update_script(root: &Path, package: &str) -> Result<String, String> {
     let expr = update_script_expr(&flake_ref(root)?, package);
     let out = nix_cmd()

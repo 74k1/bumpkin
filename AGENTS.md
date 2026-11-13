@@ -142,6 +142,7 @@ nix flake check
 - Non-numeric versions (rc/beta tags, `unstable-…` dates) are skipped by the native updater.
 - Multi-platform builds are not supported; bumpkin builds only on the local system.
 - No CVE checking or rebuild-impact estimation (unlike nixpkgs-update).
+- PR bodies carry two best-effort extras: an upstream compare link (git URL + tag prefix from the package file; none for sourcehut or when no prefix is found) and a version check that runs the built `bin/*` with `--version` / `-V` / `--help` inside a Nix derivation (60s timeout); it is skipped unless `nix config show sandbox` is `true`/`relaxed`, so upstream binaries never run unsandboxed. Neither blocks the PR.
 - No PR lookup: per-package branches are force-pushed (an open PR is updated in place) and a create-PR response containing "already exists" is treated as success. `auto` forge = `gh` for github.com, otherwise the REST API of the `origin` host (`https://<host>/api/v1` for non-GitHub).
 - Commit mode discards leftovers of a failed update (`checkout -f` + `git clean -fd`); it never resets the main branch.
 - Signing options (`--signing-key`, `--gpg-format`) are passed as one-off `git -c`, never written to the repo config.

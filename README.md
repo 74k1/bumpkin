@@ -92,6 +92,8 @@ the file are left alone. The package file is located via `meta.position`.
 
 **Dependency hash refresh:** `cargoHash`, `vendorHash`, `npmDepsHash`, `yarnHash`, `pomHash`, `mvnHash`, `mixHash`, `nugetHash`, `dotnetHash`.
 
+**PR body:** version change, build status, a check whether a built binary prints the new version (`--version`, `-V`, `--help`, run inside the Nix sandbox), an upstream compare link where one can be derived, and the nixpkgs revision.
+
 ## CI
 
 [`examples/github-actions.yaml`](examples/github-actions.yaml) is a workflow you can copy. It works with GitHub Actions and Forgejo Actions. Copy it to `.github/workflows/bumpkin.yaml` inside your package set repository (not here).

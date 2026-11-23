@@ -92,6 +92,7 @@ let
             ++ lib.optional cfg.actions.signed "--signed"
             ++ lib.optional cfg.actions.push "--push"
             ++ lib.optional (if ps.pr != null then ps.pr else cfg.actions.pr) "--pr"
+            ++ lib.optional ps.merge "--merge"
             ++ lib.optionals (ps.noBuild != []) [ "--no-build" (lib.concatStringsSep "," ps.noBuild) ]
             ++ lib.optionals (cfg.skip != []) [ "--skip" (lib.concatStringsSep "," cfg.skip) ];
           in ''
@@ -379,6 +380,11 @@ in
               '';
             };
 
+            merge = mkEnableOption ''
+              merging of new PRs once their checks succeed (immediately if the
+              repo has no checks). Gitea/Forgejo REST API only; needs PRs enabled
+              and a token with write access to the repo'';
+
             forgeTokenFile = mkOption {
               type = types.nullOr types.str;
               default = null;
@@ -536,6 +542,10 @@ in
           -> (ps.forgeTokenFile != null || cfg.forgeTokenFile != null)
         ) cfg.packageSets;
         message = "services.bumpkin.forgeTokenFile must be set (globally or per packageSet) when actions.pr is enabled (needed for forge API).";
+      }
+      {
+        assertion = lib.all (ps: ps.merge -> (if ps.pr != null then ps.pr else cfg.actions.pr)) cfg.packageSets;
+        message = "services.bumpkin.packageSets.*.merge requires PRs to be enabled for that packageSet.";
       }
       (let
         paths = map (ps: if ps.path != null then ps.path else defaultPath ps) cfg.packageSets;

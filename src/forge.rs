@@ -84,13 +84,34 @@ impl Forge {
             }
         }
     }
+
+    /// Merge a PR by its URL, or schedule the merge until its checks succeed.
+    /// Gitea/Forgejo only: GitHub has no REST endpoint for auto-merge.
+    pub fn merge_pr(&self, url: &str) -> Result<(), String> {
+        let Forge::Api { token, pulls_url } = self else {
+            return Err("merging needs the Gitea/Forgejo REST API (--forge api)".to_string());
+        };
+        let index = url.rsplit('/').next().unwrap_or_default();
+        let json = r#"{"Do":"merge","merge_when_checks_succeed":true,"delete_branch_after_merge":true}"#;
+        let merge_url = format!("{pulls_url}/{index}/merge");
+        // A new PR is unmergeable until the forge's async conflict check ends.
+        for _ in 0..5 {
+            match curl_post(&merge_url, token, json) {
+                Err(err) if err.contains("try again later") => {
+                    std::thread::sleep(std::time::Duration::from_secs(3))
+                }
+                result => return result.map(drop),
+            }
+        }
+        curl_post(&merge_url, token, json).map(drop)
+    }
 }
 
 /// POST JSON with the Authorization header passed via a stdin config file
 /// instead of argv, so the token is not visible in /proc/<pid>/cmdline.
 fn curl_post(url: &str, token: &str, body: &str) -> Result<String, String> {
     let mut child = Command::new("curl")
-        .args(["-sS", "--config", "-", "-X", "POST", "-d", body])
+        .args(["-sS", "--fail-with-body", "--config", "-", "-X", "POST", "-d", body])
         .args(["-H", "Accept: application/vnd.github+json"])
         .args(["-H", "Content-Type: application/json", url])
         .stdin(Stdio::piped())
@@ -106,7 +127,8 @@ fn curl_post(url: &str, token: &str, body: &str) -> Result<String, String> {
         .write_all(format!("header = \"Authorization: Bearer {escaped}\"\n").as_bytes())
         .map_err(|e| format!("write curl config: {e}"))?;
     let out = child.wait_with_output().map_err(|e| format!("curl {url}: {e}"))?;
-    Ok(String::from_utf8_lossy(&[out.stdout, out.stderr].concat()).into_owned())
+    let output = String::from_utf8_lossy(&[out.stdout, out.stderr].concat()).into_owned();
+    if out.status.success() { Ok(output) } else { Err(output) }
 }
 
 fn json_escape(value: &str) -> String {

@@ -174,6 +174,7 @@ Use `default` unless you need a custom bumpkin derivation:
 | `packageSets.*.noBuild` | list of str | `[]` | Package attr names to skip building (still update/commit/PR) |
 | `packageSets.*.branchPrefix` | null or str | `null` | Branch prefix override for this set (null = `branchPrefix`) |
 | `packageSets.*.pr` | null or bool | `null` | PR override for this set (null = `actions.pr`) |
+| `packageSets.*.merge` | bool | `false` | Merge new PRs once checks succeed (Gitea/Forgejo REST API only; token needs repo write access) |
 | `packageSets.*.forgeTokenFile` | null or str | `null` | Token file for this set (overrides `forgeTokenFile`) |
 | `branchPrefix` | str | `"bumpkin/"` | Per-package branch name prefix (`<prefix><package>`, no separator added) |
 | `actions.commit` | bool | `false` | Create per-package commits |

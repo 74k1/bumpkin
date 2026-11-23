@@ -46,6 +46,8 @@ Options:
       --signed               Sign commits (git commit -S)
       --push                 Push per-package branches to origin (needs --commit)
       --pr                   Open pull requests (needs --push)
+      --merge                Merge new PRs once checks succeed (needs --pr;
+                             Gitea/Forgejo REST API only)
       --signing-key <KEY>    Git user.signingkey for the commit
       --gpg-format <FORMAT>  Git gpg.format for the commit (openpgp or ssh)
       --forge <FORGE>        auto, gh, or api [default: auto]
@@ -65,6 +67,7 @@ pub struct Args {
     pub signed: bool,
     pub push: bool,
     pub pr: bool,
+    pub merge: bool,
     pub skip: Vec<String>,
     /// Packages to update without building; `*` means all.
     pub no_build: Vec<String>,
@@ -105,6 +108,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--signed" => a.signed = true,
             "--push" => a.push = true,
             "--pr" => a.pr = true,
+            "--merge" => a.merge = true,
             "--signing-key" => a.signing_key = Some(value()?),
             "--gpg-format" => a.gpg_format = Some(value()?),
             "--forge" => a.forge = value()?,
@@ -150,6 +154,9 @@ pub fn run(mut a: Args) -> Result<(), String> {
             if a.pr && !a.push {
                 return Err("--pr requires --push".to_string());
             }
+            if a.merge && !a.pr {
+                return Err("--merge requires --pr".to_string());
+            }
             // Leftover branches are force-deleted before each run, so an empty
             // prefix could delete an unrelated branch named like a package.
             if a.branch_prefix.is_empty() {
@@ -188,8 +195,8 @@ mod tests {
         assert_eq!(a.root, PathBuf::from("/tmp/flake"));
         assert_eq!(a.maintainer.as_deref(), Some("x"));
 
-        let a = parse_ok(&["update", "-p", "foo", "--commit", "--signed", "--push", "--pr"]);
-        assert!(a.commit && a.signed && a.push && a.pr);
+        let a = parse_ok(&["update", "-p", "foo", "--commit", "--signed", "--push", "--pr", "--merge"]);
+        assert!(a.commit && a.signed && a.push && a.pr && a.merge);
         assert_eq!((a.forge.as_str(), a.branch_prefix.as_str()), ("auto", "bumpkin/"));
     }
 

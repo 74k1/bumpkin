@@ -198,13 +198,23 @@ fn commit_update_one(
                 .map_err(|err| warn!("{package}: push failed: {err}"))
                 .is_ok());
     if pushed && a.pr {
-        let pr = git::remote_url(root).and_then(|remote| {
+        let forge = git::remote_url(root).and_then(|remote| {
             let token = env::var("GITHUB_TOKEN").ok();
-            forge::resolve(&a.forge, a.forge_api_url.as_deref(), token.as_deref(), &remote)?
-                .create_pr(root, &branch, main_branch, &title, &body)
+            forge::resolve(&a.forge, a.forge_api_url.as_deref(), token.as_deref(), &remote)
+        });
+        let pr = forge.as_ref().map_err(String::clone).and_then(|forge| {
+            forge.create_pr(root, &branch, main_branch, &title, &body)
         });
         match pr {
-            Ok(url) => info!("{package}: PR created: {url}"),
+            Ok(url) => {
+                info!("{package}: PR created: {url}");
+                if a.merge {
+                    match forge.and_then(|forge| forge.merge_pr(&url)) {
+                        Ok(()) => info!("{package}: PR merged or scheduled to merge"),
+                        Err(err) => warn!("{package}: PR merge failed: {err}"),
+                    }
+                }
+            }
             Err(err) if err.contains("already exists") => {
                 info!("{package}: PR already exists, branch is up to date")
             }

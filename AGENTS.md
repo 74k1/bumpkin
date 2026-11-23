@@ -123,6 +123,9 @@ Committing and PRs:
 - Branches are force-pushed unless the remote already has identical content; a create-PR
   response containing "already exists" counts as success.
 - `auto` forge: `gh` for github.com, otherwise the REST API of the `origin` host.
+- `--merge` calls the Gitea/Forgejo merge endpoint with `merge_when_checks_succeed` for a
+  newly created PR only (not when the PR already exists). It merges at once if the repo has
+  no checks. A failure is a warning. Not supported with `gh`.
 - Signing options are passed as one-off `git -c`, never written to the repo config.
 - PR body extras are best-effort and never block: compare link, `meta.changelog` /
   `meta.homepage`, dependents (via `nix-store --query --referrers-closure`; nothing for

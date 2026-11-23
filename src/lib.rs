@@ -41,6 +41,7 @@ Options:
   -v, --verbose              Show internal steps and diffs
       --skip <A,B>           Packages to skip (also: BUMPKIN_SKIP env var)
       --no-build [<A,B>]     Packages to update without building (no value: all)
+      --gc                   Collect Nix store garbage after each package
       --commit               Commit each update on its own branch
       --signed               Sign commits (git commit -S)
       --push                 Push per-package branches to origin (needs --commit)
@@ -67,6 +68,7 @@ pub struct Args {
     pub skip: Vec<String>,
     /// Packages to update without building; `*` means all.
     pub no_build: Vec<String>,
+    pub gc: bool,
     pub signing_key: Option<String>,
     pub gpg_format: Option<String>,
     pub forge: String,
@@ -98,6 +100,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Args, String> {
             "-v" | "--verbose" => a.verbose = true,
             "--skip" => a.skip = list(value()?),
             "--no-build" => a.no_build = list(optional().unwrap_or("*".into())),
+            "--gc" => a.gc = true,
             "--commit" => a.commit = true,
             "--signed" => a.signed = true,
             "--push" => a.push = true,
@@ -153,7 +156,11 @@ pub fn run(mut a: Args) -> Result<(), String> {
                 return Err("--branch-prefix must not be empty".to_string());
             }
             if let Some(package) = a.package.as_deref() {
-                update::update_package(&a.root, package, &a)
+                let result = update::update_package(&a.root, package, &a);
+                if a.gc {
+                    nix::collect_garbage();
+                }
+                result
             } else if let Some(maintainer) = a.maintainer.as_deref() {
                 update::update_maintainer(&a.root, maintainer, &a)
             } else {
@@ -192,9 +199,9 @@ mod tests {
         assert_eq!(a.branch_prefix, "upkeep/");
         assert_eq!((a.skip, a.no_build), (vec!["a".to_string(), "b".into()], vec!["c".to_string()]));
 
-        let a = parse_ok(&["update", "--no-build", "--commit"]);
+        let a = parse_ok(&["update", "--no-build", "--commit", "--gc"]);
         assert_eq!(a.no_build, vec!["*".to_string()]);
-        assert!(a.commit);
+        assert!(a.commit && a.gc);
     }
 
     #[test]

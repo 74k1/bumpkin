@@ -58,6 +58,9 @@ bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build wa
 
 # Skip all builds (bare --no-build)
 bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --no-build
+
+# Collect Nix store garbage after each package (store-wide: deletes every unrooted path)
+bumpkin update --maintainer 74k1 --root $HOME/dev/tixpkgs --commit --gc
 ```
 
 **Update priority:** package-owned `updateScript` → native updater.
@@ -178,6 +181,7 @@ Use `default` unless you need a custom bumpkin derivation:
 | `actions.push` | bool | `false` | Push branches to origin |
 | `actions.pr` | bool | `false` | Open pull requests |
 | `skip` | list of str | `[]` | Package attr names to skip entirely |
+| `gc` | bool | `false` | Run `nix store gc` after each package (store-wide: deletes every unrooted path) |
 | `forgeTokenFile` | null or str | `null` | Path to forge PAT file (GitHub, Gitea, Forgejo) |
 | `gpgKeyFile` | null or str | `null` | Path to ASCII-armored GPG key |
 | `git.userName` | null or str | `null` | Git author name |

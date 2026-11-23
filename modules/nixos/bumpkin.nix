@@ -87,6 +87,7 @@ let
             ]
             ++ lib.optionals (ps.forge != null) [ "--forge" ps.forge ]
             ++ lib.optionals (ps.forgeApiUrl != null) [ "--forge-api-url" ps.forgeApiUrl ]
+            ++ lib.optional cfg.gc "--gc"
             ++ lib.optional cfg.actions.commit "--commit"
             ++ lib.optional cfg.actions.signed "--signed"
             ++ lib.optional cfg.actions.push "--push"
@@ -231,6 +232,11 @@ in
         with excessively long builds (browser forks, large compilations).
       '';
     };
+
+    gc = mkEnableOption ''
+      Nix store garbage collection after each package (`nix store gc`).
+      The collection is store-wide: it deletes every store path on the host
+      that has no GC root, not only the paths that bumpkin built'';
 
     branchPrefix = mkOption {
       type = types.strMatching ".+";

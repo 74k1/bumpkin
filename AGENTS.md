@@ -112,6 +112,9 @@ Updating:
 - A numeric version downgrade after an update is an error.
 - `--no-build` takes a list; without a value it skips all builds. Skipped packages still
   get updated, committed and PR'd. `--skip` / `BUMPKIN_SKIP` skip packages entirely.
+- `--gc` runs `nix store gc` after each package, also after a failed one. It is store-wide
+  and best-effort (a failure is a warning). It removes the old output, so the PR closure
+  diff is mostly absent on later runs.
 
 Committing and PRs:
 - Commit mode needs a clean tree and a branch (no detached HEAD). It discards leftovers of

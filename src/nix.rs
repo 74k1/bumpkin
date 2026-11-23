@@ -140,6 +140,18 @@ pub fn build_package_with_log(root: &Path, package: &str) -> Result<(bool, Strin
     Ok((out.status.success(), String::from_utf8_lossy(&log).into_owned()))
 }
 
+/// Delete every unrooted store path. Builds use `--no-link`, so this includes
+/// everything the run built or copied. Best-effort: a failure is only logged.
+pub fn collect_garbage() {
+    match nix_cmd().args(["store", "gc"]).output() {
+        Ok(out) if out.status.success() => {
+            debug!("gc: {}", String::from_utf8_lossy(&out.stderr).trim())
+        }
+        Ok(out) => warn!("nix store gc failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+        Err(e) => warn!("run nix store gc: {e}"),
+    }
+}
+
 /// Locked rev of the flake's `nixpkgs` input for PR bodies ("" if there is
 /// none); evaluated once per run.
 pub fn nixpkgs_rev(root: &Path) -> &'static str {

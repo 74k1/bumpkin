@@ -114,6 +114,9 @@ pub fn update_maintainer(root: &Path, maintainer: &str, a: &Args) -> Result<(), 
                 // Temp worktree flow: no mutation of the checkout.
                 worktree_update_one(root, name)
             };
+            if a.gc {
+                nix::collect_garbage();
+            }
             match result {
                 Ok(outcome) => {
                     log_outcome(name, outcome);
